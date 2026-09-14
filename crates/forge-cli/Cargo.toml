@@ -4,4 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
 [dependencies]
+forge-proto = { workspace = true }
+forge-common = { workspace = true }
+forge-driver = { workspace = true }
+forge-executor = { workspace = true }
+forge-client = { workspace = true }
+arrow = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }

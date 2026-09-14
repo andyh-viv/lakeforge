@@ -2837,6 +2837,33 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 [[package]]
 name = "forge-cli"
 version = "0.1.0"
+dependencies = [
+ "arrow",
+ "clap",
+ "forge-client",
+ "forge-common",
+ "forge-driver",
+ "forge-executor",
+ "forge-proto",
+ "futures",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+]
+
+[[package]]
+name = "forge-client"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "forge-common",
+ "forge-proto",
+ "futures",
+ "tokio",
+ "tonic",
+ "tracing",
+]
 
 [[package]]
 name = "forge-common"
@@ -2856,10 +2883,43 @@ dependencies = [
 [[package]]
 name = "forge-driver"
 version = "0.1.0"
+dependencies = [
+ "arrow",
+ "dashmap",
+ "datafusion",
+ "forge-common",
+ "forge-proto",
+ "forge-scheduler",
+ "forge-shuffle",
+ "forge-sql",
+ "futures",
+ "parking_lot",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+]
 
 [[package]]
 name = "forge-executor"
 version = "0.1.0"
+dependencies = [
+ "arrow",
+ "dashmap",
+ "datafusion",
+ "forge-common",
+ "forge-proto",
+ "forge-shuffle",
+ "forge-sql",
+ "futures",
+ "parking_lot",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tracing",
+]
 
 [[package]]
 name = "forge-proto"
@@ -2875,6 +2935,21 @@ dependencies = [
 [[package]]
 name = "forge-scheduler"
 version = "0.1.0"
+dependencies = [
+ "arrow",
+ "dashmap",
+ "datafusion",
+ "forge-common",
+ "forge-proto",
+ "forge-shuffle",
+ "futures",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tonic",
+ "tracing",
+]
 
 [[package]]
 name = "forge-shuffle"

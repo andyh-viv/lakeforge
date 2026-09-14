@@ -150,10 +150,14 @@ impl ShuffleWriterExec {
         let n_out = self.output_partition_count();
         let num_input_partitions = self.input.output_partitioning().partition_count();
 
+        // Identity mode: the single output file is labelled with the map
+        // partition so consumers can group by `output_partition` uniformly.
+        let identity = self.partitioning.is_none();
+        let out_index = |o: usize| if identity { partition as u32 } else { o as u32 };
         let mut writers: Vec<PartitionWriter> = (0..n_out)
             .map(|o| {
                 PartitionWriter::new(
-                    storage.partition_path(&self.job_id, self.stage_id, partition as u32, o as u32),
+                    storage.partition_path(&self.job_id, self.stage_id, partition as u32, out_index(o)),
                     Arc::clone(&schema),
                 )
             })
@@ -207,7 +211,7 @@ impl ShuffleWriterExec {
             let r = w.num_rows;
             let b = w.num_batches;
             let len = w.finish()?;
-            parts.push(o as u32);
+            parts.push(out_index(o));
             paths.push(if len == 0 { String::new() } else { path });
             rows.push(r);
             bytes.push(len);

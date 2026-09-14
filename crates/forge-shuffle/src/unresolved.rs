@@ -17,6 +17,7 @@ use datafusion::physical_plan::{
 #[derive(Debug)]
 pub struct UnresolvedShuffleExec {
     stage_id: u32,
+    #[allow(dead_code)]
     schema: SchemaRef,
     output_partition_count: usize,
     properties: Arc<PlanProperties>,

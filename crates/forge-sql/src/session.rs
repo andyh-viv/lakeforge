@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use datafusion::catalog::CatalogProviderList;
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::execution::SessionState;
@@ -19,10 +20,19 @@ pub const DEFAULT_SCHEMA: &str = "default";
 /// Builder producing a [`SessionContext`] wired with Forge defaults: the
 /// `DELTA` table factory, information schema, and settings translated from
 /// [`SessionSettings`].
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ForgeSessionBuilder {
     settings: SessionSettings,
     runtime: Option<Arc<RuntimeEnv>>,
+    catalogs: Option<Arc<dyn CatalogProviderList>>,
+}
+
+impl std::fmt::Debug for ForgeSessionBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForgeSessionBuilder")
+            .field("settings", &self.settings)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ForgeSessionBuilder {
@@ -30,11 +40,22 @@ impl ForgeSessionBuilder {
         Self {
             settings,
             runtime: None,
+            catalogs: None,
         }
+    }
+
+    pub fn settings(&self) -> &SessionSettings {
+        &self.settings
     }
 
     pub fn with_runtime(mut self, runtime: Arc<RuntimeEnv>) -> Self {
         self.runtime = Some(runtime);
+        self
+    }
+
+    /// Share a catalog list (tables, schemas) across sessions.
+    pub fn with_catalog_list(mut self, catalogs: Arc<dyn CatalogProviderList>) -> Self {
+        self.catalogs = Some(catalogs);
         self
     }
 
@@ -71,12 +92,21 @@ impl ForgeSessionBuilder {
     }
 
     pub fn build_state(&self) -> SessionState {
-        SessionStateBuilder::new()
-            .with_config(self.session_config())
+        let mut config = self.session_config();
+        if let Some(c) = &self.catalogs {
+            if c.catalog(DEFAULT_CATALOG).is_some() {
+                config = config.with_create_default_catalog_and_schema(false);
+            }
+        }
+        let mut b = SessionStateBuilder::new()
+            .with_config(config)
             .with_runtime_env(self.runtime_env())
             .with_default_features()
-            .with_table_factory("DELTA".into(), Arc::new(DeltaTableFactory {}))
-            .build()
+            .with_table_factory("DELTA".into(), Arc::new(DeltaTableFactory {}));
+        if let Some(c) = &self.catalogs {
+            b = b.with_catalog_list(Arc::clone(c));
+        }
+        b.build()
     }
 
     pub fn build(&self) -> SessionContext {

@@ -8,6 +8,7 @@ members = [
     "crates/forge-scheduler",
     "crates/forge-executor",
     "crates/forge-driver",
+    "crates/forge-client",
     "crates/forge-cli",
     "crates/lakeforge-api",
     "crates/lakeforge-cluster-manager",
@@ -94,6 +95,7 @@ forge-shuffle = { path = "crates/forge-shuffle" }
 forge-scheduler = { path = "crates/forge-scheduler" }
 forge-executor = { path = "crates/forge-executor" }
 forge-driver = { path = "crates/forge-driver" }
+forge-client = { path = "crates/forge-client" }
 lakeforge-cluster-manager = { path = "crates/lakeforge-cluster-manager" }
 
 [profile.release]
