@@ -15,14 +15,3 @@ impl std::fmt::Display for TaskId {
         )
     }
 }
-
-impl Eq for TaskId {}
-
-impl std::hash::Hash for TaskId {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.job_id.hash(state);
-        self.stage_id.hash(state);
-        self.partition_id.hash(state);
-        self.attempt.hash(state);
-    }
-}
