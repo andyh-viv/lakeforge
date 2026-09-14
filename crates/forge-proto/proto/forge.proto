@@ -1,0 +1,364 @@
+syntax = "proto3";
+
+package forge;
+
+// ---------------------------------------------------------------------------
+// Forge distributed compute protocol.
+//
+// Topology:
+//   client  --gRPC-->  driver  --gRPC-->  executor(s)
+//   executor <--gRPC--> executor           (shuffle fetch)
+//   executor  --gRPC-->  driver             (registration / heartbeat / status)
+// ---------------------------------------------------------------------------
+
+message ExecutorMetadata {
+  string id = 1;
+  string host = 2;
+  uint32 port = 3;
+  uint32 task_slots = 4;
+  map<string, string> labels = 5;
+}
+
+message ExecutorResources {
+  uint64 total_memory_bytes = 1;
+  uint64 available_memory_bytes = 2;
+  uint32 cpu_cores = 3;
+  uint32 free_task_slots = 4;
+}
+
+message RegisterExecutorRequest {
+  ExecutorMetadata metadata = 1;
+  ExecutorResources resources = 2;
+}
+
+message RegisterExecutorResponse {
+  bool accepted = 1;
+  string driver_id = 2;
+}
+
+message HeartbeatRequest {
+  string executor_id = 1;
+  ExecutorResources resources = 2;
+  uint64 timestamp_ms = 3;
+  repeated TaskStatus running_tasks = 4;
+}
+
+message HeartbeatResponse {
+  bool known = 1;
+  // Job ids the executor may purge shuffle output for.
+  repeated string completed_jobs = 2;
+}
+
+// Identity of a single task: (job, stage, partition, attempt)
+message TaskId {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  uint32 partition_id = 3;
+  uint32 attempt = 4;
+}
+
+message TaskDefinition {
+  TaskId id = 1;
+  // datafusion-proto encoded physical plan (root is a ShuffleWriterExec)
+  bytes plan = 2;
+  // Session configuration key/values applied on the executor.
+  map<string, string> session_config = 3;
+  string work_dir = 4;
+}
+
+message LaunchTaskRequest {
+  repeated TaskDefinition tasks = 1;
+  string driver_addr = 2;
+}
+
+message LaunchTaskResponse {
+  repeated TaskId accepted = 1;
+  repeated TaskId rejected = 2;
+}
+
+message CancelTaskRequest {
+  repeated TaskId ids = 1;
+}
+
+message CancelTaskResponse {
+  uint32 cancelled = 1;
+}
+
+enum TaskState {
+  TASK_PENDING = 0;
+  TASK_RUNNING = 1;
+  TASK_COMPLETED = 2;
+  TASK_FAILED = 3;
+  TASK_CANCELLED = 4;
+}
+
+// Location of one shuffle output partition produced by a map task.
+message ShufflePartitionLocation {
+  uint32 map_partition_id = 1;
+  uint32 output_partition_id = 2;
+  string executor_id = 3;
+  string executor_addr = 4;
+  string path = 5;
+  uint64 num_rows = 6;
+  uint64 num_bytes = 7;
+  uint32 num_batches = 8;
+}
+
+message TaskMetrics {
+  uint64 output_rows = 1;
+  uint64 output_bytes = 2;
+  uint64 elapsed_compute_ns = 3;
+  uint64 spilled_bytes = 4;
+  uint64 start_ms = 5;
+  uint64 end_ms = 6;
+}
+
+message TaskStatus {
+  TaskId id = 1;
+  TaskState state = 2;
+  string executor_id = 3;
+  string error = 4;
+  repeated ShufflePartitionLocation outputs = 5;
+  TaskMetrics metrics = 6;
+}
+
+message TaskStatusUpdateRequest {
+  repeated TaskStatus statuses = 1;
+}
+
+message TaskStatusUpdateResponse {}
+
+message FetchShuffleRequest {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  uint32 map_partition_id = 3;
+  uint32 output_partition_id = 4;
+  string path = 5;
+}
+
+// Arrow IPC stream chunk.
+message ShuffleChunk {
+  bytes ipc = 1;
+  bool last = 2;
+}
+
+message RemoveJobDataRequest {
+  string job_id = 1;
+}
+
+message RemoveJobDataResponse {
+  uint64 bytes_freed = 1;
+}
+
+// ------------------------- physical plan extensions -------------------------
+
+message ShuffleWriterExecNode {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  // datafusion_proto Partitioning (prost-encoded); absent => identity
+  bytes partitioning = 3;
+  string work_dir = 4;
+}
+
+message PartitionLocations {
+  repeated ShufflePartitionLocation locations = 1;
+}
+
+message ShuffleReaderExecNode {
+  string job_id = 1;
+  uint32 stage_id = 2;
+  // datafusion_proto Schema (prost-encoded)
+  bytes schema = 3;
+  // one entry per output partition
+  repeated PartitionLocations partitions = 4;
+}
+
+message UnresolvedShuffleExecNode {
+  uint32 stage_id = 1;
+  bytes schema = 2;
+  uint32 output_partition_count = 3;
+}
+
+message ForgeExecNode {
+  oneof node {
+    ShuffleWriterExecNode writer = 1;
+    ShuffleReaderExecNode reader = 2;
+    UnresolvedShuffleExecNode unresolved = 3;
+  }
+}
+
+// ------------------------------- client API --------------------------------
+
+message SqlRequest {
+  string sql = 1;
+  string session_id = 2;
+  map<string, string> session_config = 3;
+  string catalog = 4;
+  string schema = 5;
+  // Limit results streamed back (0 = unlimited)
+  uint64 max_rows = 6;
+}
+
+message ResultChunk {
+  oneof payload {
+    QueryStarted started = 1;
+    // Arrow IPC stream fragment (schema message first, then record batches)
+    bytes ipc = 2;
+    QueryProgress progress = 3;
+    QueryFinished finished = 4;
+  }
+}
+
+message QueryStarted {
+  string job_id = 1;
+  string explain = 2;
+}
+
+message QueryProgress {
+  uint32 total_stages = 1;
+  uint32 completed_stages = 2;
+  uint32 total_tasks = 3;
+  uint32 completed_tasks = 4;
+  uint32 running_tasks = 5;
+  uint32 failed_tasks = 6;
+}
+
+message QueryFinished {
+  uint64 rows = 1;
+  uint64 elapsed_ms = 2;
+  repeated StageSummary stages = 3;
+}
+
+message StageSummary {
+  uint32 stage_id = 1;
+  uint32 num_tasks = 2;
+  uint64 output_rows = 3;
+  uint64 output_bytes = 4;
+  uint64 elapsed_ms = 5;
+}
+
+message ExplainRequest {
+  string sql = 1;
+  string session_id = 2;
+  bool verbose = 3;
+}
+
+message ExplainResponse {
+  string logical_plan = 1;
+  string physical_plan = 2;
+  string distributed_plan = 3;
+}
+
+message CancelQueryRequest {
+  string job_id = 1;
+}
+
+message CancelQueryResponse {
+  bool cancelled = 1;
+}
+
+message ListExecutorsRequest {}
+
+message ExecutorInfo {
+  ExecutorMetadata metadata = 1;
+  ExecutorResources resources = 2;
+  uint64 last_heartbeat_ms = 3;
+  uint32 running_tasks = 4;
+  uint64 completed_tasks = 5;
+  uint64 failed_tasks = 6;
+}
+
+message ListExecutorsResponse {
+  repeated ExecutorInfo executors = 1;
+  string driver_id = 2;
+}
+
+message JobInfo {
+  string job_id = 1;
+  string sql = 2;
+  string state = 3;
+  uint64 submitted_ms = 4;
+  uint64 finished_ms = 5;
+  QueryProgress progress = 6;
+  string error = 7;
+}
+
+message ListJobsRequest {
+  uint32 limit = 1;
+}
+
+message ListJobsResponse {
+  repeated JobInfo jobs = 1;
+}
+
+message GetJobRequest {
+  string job_id = 1;
+}
+
+message GetJobResponse {
+  JobInfo job = 1;
+  repeated StageInfo stages = 2;
+}
+
+message StageInfo {
+  uint32 stage_id = 1;
+  string state = 2;
+  uint32 num_partitions = 3;
+  uint32 completed = 4;
+  uint32 running = 5;
+  uint32 failed = 6;
+  string plan = 7;
+  repeated uint32 depends_on = 8;
+}
+
+message RegisterTableRequest {
+  string name = 1;
+  string location = 2;
+  // parquet | csv | json | delta
+  string format = 3;
+  map<string, string> options = 4;
+  string catalog = 5;
+  string schema = 6;
+}
+
+message RegisterTableResponse {
+  string schema_json = 1;
+}
+
+message DriverStatusRequest {}
+
+message DriverStatusResponse {
+  string driver_id = 1;
+  string version = 2;
+  uint64 uptime_ms = 3;
+  uint32 executors = 4;
+  uint32 total_slots = 5;
+  uint32 free_slots = 6;
+  uint32 running_jobs = 7;
+}
+
+// Driver-side service used by both clients and executors.
+service DriverService {
+  // executor -> driver
+  rpc RegisterExecutor(RegisterExecutorRequest) returns (RegisterExecutorResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc UpdateTaskStatus(TaskStatusUpdateRequest) returns (TaskStatusUpdateResponse);
+
+  // client -> driver
+  rpc ExecuteSql(SqlRequest) returns (stream ResultChunk);
+  rpc Explain(ExplainRequest) returns (ExplainResponse);
+  rpc CancelQuery(CancelQueryRequest) returns (CancelQueryResponse);
+  rpc RegisterTable(RegisterTableRequest) returns (RegisterTableResponse);
+  rpc ListExecutors(ListExecutorsRequest) returns (ListExecutorsResponse);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  rpc Status(DriverStatusRequest) returns (DriverStatusResponse);
+}
+
+// Executor-side service used by the driver and by peer executors.
+service ExecutorService {
+  rpc LaunchTasks(LaunchTaskRequest) returns (LaunchTaskResponse);
+  rpc CancelTasks(CancelTaskRequest) returns (CancelTaskResponse);
+  rpc FetchShuffle(FetchShuffleRequest) returns (stream ShuffleChunk);
+  rpc RemoveJobData(RemoveJobDataRequest) returns (RemoveJobDataResponse);
+}

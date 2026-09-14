@@ -1,0 +1,16 @@
+[package]
+name = "forge-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+datafusion = { workspace = true }
+arrow = { workspace = true }
+tonic = { workspace = true }

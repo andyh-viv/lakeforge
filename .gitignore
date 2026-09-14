@@ -1,0 +1,12 @@
+target/
+node_modules/
+dist/
+*.arrow
+/data/
+/.forge/
+.env
+*.tfstate*
+.terraform/
+__pycache__/
+*.egg-info/
+.venv/

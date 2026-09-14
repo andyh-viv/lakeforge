@@ -1,0 +1,23 @@
+[package]
+name = "forge-shuffle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-proto = { workspace = true }
+forge-common = { workspace = true }
+arrow = { workspace = true }
+arrow-ipc = { workspace = true }
+datafusion = { workspace = true }
+datafusion-proto = { workspace = true }
+prost = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
