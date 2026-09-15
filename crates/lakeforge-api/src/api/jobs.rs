@@ -927,6 +927,30 @@ fn needs_cluster(def: &Map<String, Value>) -> bool {
     def.contains_key("notebook_task") || def.contains_key("spark_python_task") || def.contains_key("for_each_task")
 }
 
+/// Spark `show()`-style rendering of a tabular output.
+fn format_table(columns: &[String], rows: &[Vec<Value>], truncated: bool) -> String {
+    let cell = |v: &Value| match v {
+        Value::Null => "null".to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let text_rows: Vec<Vec<String>> = rows.iter().map(|r| r.iter().map(cell).collect()).collect();
+    let widths: Vec<usize> = columns.iter().enumerate().map(|(i, c)| text_rows.iter().map(|r| r.get(i).map_or(0, |s| s.chars().count())).max().unwrap_or(0).max(c.chars().count())).collect();
+    let sep = format!("+{}+\n", widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>().join("+"));
+    let line = |cells: Vec<String>| format!("|{}|\n", cells.iter().enumerate().map(|(i, s)| format!("{s:<w$}", w = widths.get(i).copied().unwrap_or(0))).collect::<Vec<_>>().join("|"));
+    let mut out = sep.clone();
+    out.push_str(&line(columns.to_vec()));
+    out.push_str(&sep);
+    for r in text_rows {
+        out.push_str(&line(r));
+    }
+    out.push_str(&sep);
+    if truncated {
+        out.push_str("(output truncated)\n");
+    }
+    out
+}
+
 fn summarize_outputs(outputs: &[crate::kernel::KernelEvent]) -> (String, Option<String>, Option<String>) {
     let mut logs = String::new();
     let mut err = None;
@@ -934,6 +958,17 @@ fn summarize_outputs(outputs: &[crate::kernel::KernelEvent]) -> (String, Option<
     for o in outputs {
         match o {
             crate::kernel::KernelEvent::Stdout { text } | crate::kernel::KernelEvent::Stderr { text } | crate::kernel::KernelEvent::Result { text } => logs.push_str(text),
+            crate::kernel::KernelEvent::Table { columns, rows, truncated } => {
+                logs.push_str(&format_table(columns, rows, *truncated));
+            }
+            crate::kernel::KernelEvent::Display { mime, data } if mime.starts_with("text/") => {
+                if let Some(s) = data.as_str() {
+                    logs.push_str(s);
+                    if !s.ends_with('\n') {
+                        logs.push('\n');
+                    }
+                }
+            }
             crate::kernel::KernelEvent::Error { ename, evalue, traceback } => {
                 err = Some(format!("{ename}: {evalue}"));
                 trace = Some(traceback.join(""));
