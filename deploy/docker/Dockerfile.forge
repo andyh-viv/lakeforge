@@ -1,0 +1,26 @@
+# Forge compute image (driver / executor pods launched by the Kubernetes
+# cluster backend).
+#
+#   docker build -f deploy/docker/Dockerfile.forge -t lakeforge/forge .
+
+FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p forge-cli \
+    && mkdir -p /out && cp target/release/forge /out/
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --create-home forge && mkdir -p /tmp/forge && chown forge /tmp/forge
+COPY --from=build /out/forge /usr/local/bin/forge
+USER forge
+ENV RUST_LOG=info FORGE_WORK_DIR=/tmp/forge
+EXPOSE 50051 50052
+ENTRYPOINT ["/usr/bin/tini", "--", "forge"]
+CMD ["--help"]

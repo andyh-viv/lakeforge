@@ -1,0 +1,108 @@
+# Default values for the lakeforge chart.
+
+image:
+  repository: ghcr.io/andyh-viv/lakeforge-api
+  tag: ""            # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+forge:
+  # Image used for driver / executor pods created by the Kubernetes cluster backend.
+  image: ghcr.io/andyh-viv/lakeforge-forge
+  tag: ""
+  # Namespace where Forge clusters are launched (created by the chart).
+  namespace: lakeforge-compute
+  # Extra env injected into every Forge pod, in addition to storage.env (cloud
+  # credentials usually come from the workload identity bound to
+  # serviceAccount.compute instead).
+  env: {}
+  # Extra labels on Forge pods (e.g. azure.workload.identity/use: "true").
+  podLabels: {}
+  # Schedule Forge pods onto a dedicated node pool.
+  nodeSelector: {}
+
+replicaCount: 1
+
+controlPlane:
+  # Public URL users reach the workspace at (ingress host or LB address).
+  publicUrl: ""
+  cloud: kubernetes           # local | aws | gcp | azure | kubernetes
+  adminUser: admin@lakeforge.local
+  # Set adminPassword or existingSecret (keys: admin-password, jwt-secret, database-url)
+  adminPassword: ""
+  jwtSecret: ""
+  existingSecret: ""
+  logLevel: info
+  tickSecs: 5
+  extraEnv: []                # list of {name, value} or {name, valueFrom}
+
+database:
+  # postgres://user:pass@host:5432/db. Empty => embedded SQLite on the data PVC
+  # (single replica only).
+  url: ""
+  # If true and url is empty, deploy a single-node Postgres StatefulSet in-cluster.
+  embeddedPostgres:
+    enabled: false
+    image: postgres:16-alpine
+    storage: 20Gi
+    storageClass: ""
+    password: lakeforge
+
+storage:
+  # Object store root for DBFS, notebooks, MLflow artifacts and managed Delta
+  # tables: s3://bucket/prefix | gs://bucket/prefix | az://container/prefix.
+  # Empty => local PVC (single replica only).
+  root: ""
+  # Env vars passed to the api and Forge pods for object-store access
+  # (e.g. AWS_REGION, AZURE_STORAGE_ACCOUNT_NAME). Credentials should come from
+  # workload identity where possible.
+  env: {}
+  # Local persistent volume used when storage.root is empty / for scratch.
+  persistence:
+    enabled: true
+    size: 50Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}             # e.g. eks.amazonaws.com/role-arn or iam.gke.io/gcp-service-account
+  compute:
+    create: true
+    name: forge
+    annotations: {}
+
+rbac:
+  create: true
+
+service:
+  type: ClusterIP
+  port: 80
+  annotations: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: lakeforge.example.com
+  tls: []                     # - secretName: lakeforge-tls, hosts: [lakeforge.example.com]
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 4Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+podLabels: {}
+podSecurityContext:
+  fsGroup: 10001
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  allowPrivilegeEscalation: false

@@ -1,0 +1,108 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  rust:
+    name: Rust (build, test, clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - name: Build
+        run: cargo build --workspace --locked
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --locked -- -D warnings
+      - name: Distributed SQL smoke (local Forge cluster)
+        run: |
+          set -euo pipefail
+          target/debug/forge local --executors 2 --slots 2 > /tmp/forge.log 2>&1 &
+          for i in $(seq 1 30); do
+            target/debug/forge sql --json -e "SELECT 40 + 2 AS answer" >/tmp/out.txt 2>&1 && break || sleep 1
+          done
+          cat /tmp/out.txt
+          grep -q '"answer":42' /tmp/out.txt
+      - name: Control-plane smoke
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/lf && cd /tmp/lf
+          LAKEFORGE_BIND=127.0.0.1:8080 LAKEFORGE_FORGE_BIN=$GITHUB_WORKSPACE/target/debug/forge \
+            $GITHUB_WORKSPACE/target/debug/lakeforge-api > api.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/health && break || sleep 1; done
+          curl -sf -u admin@lakeforge.local:admin http://127.0.0.1:8080/api/2.0/preview/scim/v2/Me | grep -q admin@lakeforge.local
+          curl -sf -u admin@lakeforge.local:admin http://127.0.0.1:8080/api/2.1/unity-catalog/catalogs | grep -q catalogs
+
+  python-sdk:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e "python/lakeforge-sdk[dev]"
+      - run: python -m pytest -q python/lakeforge-sdk/tests
+      - run: python -m compileall -q python/lakeforge-sdk/lakeforge
+
+  web:
+    name: Web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run lint
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+
+  deploy-manifests:
+    name: Deploy manifests (helm, terraform, compose)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.13.3"
+      - name: Helm lint + template
+        run: |
+          helm lint deploy/helm/lakeforge
+          helm template lakeforge deploy/helm/lakeforge --set database.embeddedPostgres.enabled=true --set ingress.enabled=true > /dev/null
+      - name: Terraform fmt + validate
+        run: |
+          terraform fmt -check -recursive deploy/terraform
+          for d in modules/lakeforge aws gcp azure; do
+            (cd deploy/terraform/$d && terraform init -backend=false -input=false >/dev/null && terraform validate)
+          done
+      - name: Compose config
+        run: docker compose -f deploy/docker/docker-compose.yml config > /dev/null
+      - name: deploy.sh syntax
+        run: bash -n deploy/deploy.sh

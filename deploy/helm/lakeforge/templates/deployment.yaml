@@ -1,0 +1,131 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "lakeforge.fullname" . }}
+  labels: {{- include "lakeforge.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "lakeforge.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "lakeforge.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}{{ toYaml . | nindent 8 }}{{ end }}
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}{{ toYaml . | nindent 8 }}{{ end }}
+    spec:
+      serviceAccountName: {{ include "lakeforge.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: api
+          image: "{{ .Values.image.repository }}:{{ include "lakeforge.imageTag" . }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: LAKEFORGE_BIND
+              value: 0.0.0.0:8080
+            - name: LAKEFORGE_PUBLIC_URL
+              value: {{ .Values.controlPlane.publicUrl | default (printf "http://%s.%s.svc" (include "lakeforge.fullname" .) .Release.Namespace) | quote }}
+            - name: LAKEFORGE_CLOUD
+              value: {{ .Values.controlPlane.cloud | quote }}
+            - name: LAKEFORGE_ADMIN_USER
+              value: {{ .Values.controlPlane.adminUser | quote }}
+            - name: LAKEFORGE_ADMIN_PASSWORD
+              valueFrom: { secretKeyRef: { name: {{ include "lakeforge.secretName" . }}, key: admin-password } }
+            - name: LAKEFORGE_JWT_SECRET
+              valueFrom: { secretKeyRef: { name: {{ include "lakeforge.secretName" . }}, key: jwt-secret } }
+            - name: LAKEFORGE_DATABASE_URL
+              valueFrom: { secretKeyRef: { name: {{ include "lakeforge.secretName" . }}, key: database-url } }
+            - name: LAKEFORGE_STORAGE_ROOT
+              value: {{ .Values.storage.root | default "/var/lib/lakeforge/data/storage" | quote }}
+            - name: LAKEFORGE_WORK_DIR
+              value: /var/lib/lakeforge/data/work
+            - name: LAKEFORGE_TICK_SECS
+              value: {{ .Values.controlPlane.tickSecs | quote }}
+            - name: LAKEFORGE_CLUSTER_BACKEND
+              value: kubernetes
+            - name: LAKEFORGE_K8S_NAMESPACE
+              value: {{ .Values.forge.namespace | quote }}
+            - name: LAKEFORGE_FORGE_IMAGE
+              value: {{ include "lakeforge.forgeImage" . | quote }}
+            {{- if .Values.serviceAccount.compute.create }}
+            - name: LAKEFORGE_K8S_SERVICE_ACCOUNT
+              value: {{ .Values.serviceAccount.compute.name | quote }}
+            {{- end }}
+            {{- $forgeEnv := merge (dict) .Values.forge.env .Values.storage.env }}
+            {{- if $forgeEnv }}
+            - name: LAKEFORGE_FORGE_ENV
+              value: {{ include "lakeforge.kvList" $forgeEnv | quote }}
+            {{- end }}
+            {{- with .Values.forge.podLabels }}
+            - name: LAKEFORGE_FORGE_POD_LABELS
+              value: {{ include "lakeforge.kvList" . | quote }}
+            {{- end }}
+            {{- with .Values.forge.nodeSelector }}
+            - name: LAKEFORGE_FORGE_NODE_SELECTOR
+              value: {{ include "lakeforge.kvList" . | quote }}
+            {{- end }}
+            - name: RUST_LOG
+              value: {{ .Values.controlPlane.logLevel | quote }}
+            {{- range $k, $v := .Values.storage.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- with .Values.controlPlane.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/lakeforge/data
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: data
+          {{- if .Values.storage.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "lakeforge.fullname" . }}-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if .Values.storage.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "lakeforge.fullname" . }}-data
+  labels: {{- include "lakeforge.labels" . | nindent 4 }}
+spec:
+  accessModes: [{{ .Values.storage.persistence.accessMode }}]
+  {{- with .Values.storage.persistence.storageClass }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.persistence.size }}
+{{- end }}

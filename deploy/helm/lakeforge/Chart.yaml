@@ -1,0 +1,9 @@
+apiVersion: v2
+name: lakeforge
+description: Lakeforge - Databricks-compatible lakehouse platform (control plane + Forge compute) on Kubernetes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords: [lakehouse, databricks, spark, datafusion, delta]
+sources:
+  - https://github.com/andyh-viv/lakeforge

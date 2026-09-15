@@ -1,0 +1,52 @@
+# Lakeforge control plane image: lakeforge-api + forge (for the local cluster
+# backend) + built web UI + python3 with the lakeforge SDK for notebook kernels.
+#
+#   docker build -f deploy/docker/Dockerfile.api -t lakeforge/api .
+
+# ---------------------------------------------------------------- web UI ----
+FROM node:24-bookworm-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+# ------------------------------------------------------------------ rust ----
+FROM rust:1-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p lakeforge-api -p forge-cli \
+    && mkdir -p /out && cp target/release/lakeforge-api target/release/forge /out/
+
+# --------------------------------------------------------------- runtime ----
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates git python3 python3-pip python3-venv curl tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --uid 10001 --create-home --home-dir /var/lib/lakeforge lakeforge
+COPY --from=build /out/lakeforge-api /out/forge /usr/local/bin/
+COPY --from=web /web/dist /opt/lakeforge/ui
+COPY python/lakeforge-sdk /opt/lakeforge/sdk
+RUN pip3 install --break-system-packages --no-cache-dir /opt/lakeforge/sdk pandas \
+    && chown -R lakeforge:lakeforge /opt/lakeforge /var/lib/lakeforge
+
+USER lakeforge
+WORKDIR /var/lib/lakeforge
+ENV LAKEFORGE_BIND=0.0.0.0:8080 \
+    LAKEFORGE_UI_DIR=/opt/lakeforge/ui \
+    LAKEFORGE_DATABASE_URL=sqlite:///var/lib/lakeforge/data/lakeforge.db?mode=rwc \
+    LAKEFORGE_STORAGE_ROOT=/var/lib/lakeforge/data/storage \
+    LAKEFORGE_WORK_DIR=/var/lib/lakeforge/data/work \
+    LAKEFORGE_CLUSTER_WORK_DIR=/var/lib/lakeforge/data/clusters \
+    LAKEFORGE_FORGE_BIN=/usr/local/bin/forge \
+    LAKEFORGE_PYTHON=python3 \
+    RUST_LOG=info
+VOLUME ["/var/lib/lakeforge/data"]
+EXPOSE 8080
+HEALTHCHECK --interval=15s --timeout=3s --start-period=20s CMD curl -sf http://localhost:8080/health || exit 1
+ENTRYPOINT ["/usr/bin/tini", "--", "lakeforge-api"]

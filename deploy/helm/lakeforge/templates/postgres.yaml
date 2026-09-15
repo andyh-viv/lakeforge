@@ -1,0 +1,57 @@
+{{- if and .Values.database.embeddedPostgres.enabled (not .Values.database.url) }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "lakeforge.fullname" . }}-postgres
+  labels: {{- include "lakeforge.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  ports: [{ name: pg, port: 5432 }]
+  selector:
+    app.kubernetes.io/name: {{ include "lakeforge.name" . }}-postgres
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "lakeforge.fullname" . }}-postgres
+  labels: {{- include "lakeforge.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "lakeforge.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "lakeforge.name" . }}-postgres
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "lakeforge.name" . }}-postgres
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.database.embeddedPostgres.image }}
+          env:
+            - { name: POSTGRES_USER, value: lakeforge }
+            - { name: POSTGRES_DB, value: lakeforge }
+            - { name: POSTGRES_PASSWORD, value: {{ .Values.database.embeddedPostgres.password | quote }} }
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [{ name: pg, containerPort: 5432 }]
+          volumeMounts:
+            - { name: pgdata, mountPath: /var/lib/postgresql/data }
+          readinessProbe:
+            exec: { command: ["pg_isready", "-U", "lakeforge"] }
+            periodSeconds: 5
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- with .Values.database.embeddedPostgres.storageClass }}
+        storageClassName: {{ . }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.database.embeddedPostgres.storage }}
+{{- end }}
