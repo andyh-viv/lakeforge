@@ -169,13 +169,30 @@ pub fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+const IMPLICIT_ROOTS: [&str; 3] = ["/Users", "/Shared", "/Repos"];
+
 impl AppState {
+    /// Well-known folders that exist in every workspace without being created:
+    /// the top-level roots and `/Users/<user>` for every known user.
+    async fn ws_is_implicit_dir(&self, path: &str) -> ApiResult<bool> {
+        if IMPLICIT_ROOTS.contains(&path) {
+            return Ok(true);
+        }
+        match path.strip_prefix("/Users/") {
+            Some(name) if !name.is_empty() && !name.contains('/') => Ok(self.user_by_name(name).await?.is_some()),
+            _ => Ok(false),
+        }
+    }
+
     pub async fn ws_get(&self, path: &str) -> ApiResult<Option<WsObject>> {
         let path = normalize(path)?;
-        if path == "/" {
+        if let Some(d) = self.store.get::<WsObject>(KIND, &path).await? {
+            return Ok(Some(d.data));
+        }
+        if path == "/" || self.ws_is_implicit_dir(&path).await? {
             return Ok(Some(WsObject { object_type: ObjectType::Directory, path, language: None, object_id: 0, created_at: 0, modified_at: 0, size: 0, notebook: None, created_by: String::new(), repo_id: None }));
         }
-        Ok(self.store.get::<WsObject>(KIND, &path).await?.map(|d| d.data))
+        Ok(None)
     }
 
     pub async fn ws_require(&self, path: &str) -> ApiResult<WsObject> {
@@ -186,6 +203,13 @@ impl AppState {
         let path = normalize(path)?;
         let docs: Vec<Doc<WsObject>> = self.store.list(KIND, self.ws(), Filter { parent_id: Some(&path), ..Default::default() }).await?;
         let mut items: Vec<WsObject> = docs.into_iter().map(|d| d.data).collect();
+        if path == "/" {
+            for root in IMPLICIT_ROOTS {
+                if !items.iter().any(|o| o.path == root) {
+                    items.push(WsObject { object_type: ObjectType::Directory, path: root.to_string(), language: None, object_id: 0, created_at: 0, modified_at: 0, size: 0, notebook: None, created_by: String::new(), repo_id: None });
+                }
+            }
+        }
         items.sort_by(|a, b| (a.object_type != ObjectType::Directory).cmp(&(b.object_type != ObjectType::Directory)).then_with(|| a.path.to_ascii_lowercase().cmp(&b.path.to_ascii_lowercase())));
         Ok(items)
     }
