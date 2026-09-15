@@ -14,7 +14,7 @@ use datafusion::error::Result as DFResult;
 use deltalake::delta_datafusion::DeltaTableFactory;
 use forge_common::config::SessionSettings;
 
-pub const DEFAULT_CATALOG: &str = "forge";
+pub const DEFAULT_CATALOG: &str = "main";
 pub const DEFAULT_SCHEMA: &str = "default";
 
 /// Builder producing a [`SessionContext`] wired with Forge defaults: the
@@ -75,8 +75,8 @@ impl ForgeSessionBuilder {
         cfg.options_mut().execution.parquet.pushdown_filters = true;
         cfg.options_mut().execution.parquet.reorder_filters = true;
         cfg.options_mut().optimizer.enable_round_robin_repartition = true;
-        cfg.options_mut().catalog.default_catalog = DEFAULT_CATALOG.into();
-        cfg.options_mut().catalog.default_schema = DEFAULT_SCHEMA.into();
+        cfg.options_mut().catalog.default_catalog = s.default_catalog.clone().unwrap_or_else(|| DEFAULT_CATALOG.into());
+        cfg.options_mut().catalog.default_schema = s.default_schema.clone().unwrap_or_else(|| DEFAULT_SCHEMA.into());
         cfg
     }
 

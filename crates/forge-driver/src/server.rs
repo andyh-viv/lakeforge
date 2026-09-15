@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ipc::writer::StreamWriter;
+use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::prelude::SessionContext;
 use datafusion::logical_expr::{LogicalPlan, Statement};
 use datafusion::physical_plan::{displayable, execute_stream_partitioned, ExecutionPlan};
 use forge_common::ForgeError;
@@ -41,7 +43,7 @@ impl DriverServer {
         Self {
             config,
             scheduler,
-            sessions: Arc::new(SessionManager::new(Default::default())),
+            sessions: Arc::new(SessionManager::new(forge_common::config::SessionSettings::from_env())),
             started: Instant::now(),
         }
     }
@@ -243,6 +245,26 @@ where
     Ok(rows)
 }
 
+/// Make sure `catalog.schema` exists so tables can be registered under it.
+fn ensure_namespace(ctx: &SessionContext, catalog: &str, schema: &str) -> DFResult<()> {
+    if schema.is_empty() {
+        return Ok(());
+    }
+    let catalog_name = if catalog.is_empty() { forge_sql::session::DEFAULT_CATALOG } else { catalog };
+    let cat = match ctx.catalog(catalog_name) {
+        Some(c) => c,
+        None => {
+            let c: Arc<dyn CatalogProvider> = Arc::new(MemoryCatalogProvider::new());
+            ctx.register_catalog(catalog_name, Arc::clone(&c));
+            c
+        }
+    };
+    if cat.schema(schema).is_none() {
+        cat.register_schema(schema, Arc::new(MemorySchemaProvider::new()))?;
+    }
+    Ok(())
+}
+
 fn to_status(e: ForgeError) -> Status {
     match e {
         ForgeError::NotFound(m) => Status::not_found(m),
@@ -340,6 +362,7 @@ impl DriverService for DriverServer {
         let spec = TableSpec { name, format, location: req.location, options: req.options };
         let session = self.sessions.session("", &HashMap::new());
         let ctx = self.sessions.context(&session);
+        ensure_namespace(&ctx, &req.catalog, &req.schema).map_err(|e| to_status(e.into()))?;
         let schema = register_table(&ctx, &spec).await.map_err(|e| to_status(e.into()))?;
         let fields: Vec<serde_json::Value> = schema
             .fields()

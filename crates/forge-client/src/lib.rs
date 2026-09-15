@@ -206,14 +206,27 @@ impl ForgeClient {
         location: &str,
         options: HashMap<String, String>,
     ) -> Result<String> {
+        self.register_table_in("", "", name, format, location, options).await
+    }
+
+    /// Register a table under an explicit `catalog.schema` namespace (created if missing).
+    pub async fn register_table_in(
+        &self,
+        catalog: &str,
+        schema: &str,
+        name: &str,
+        format: &str,
+        location: &str,
+        options: HashMap<String, String>,
+    ) -> Result<String> {
         let mut c = self.inner.clone();
         Ok(c.register_table(RegisterTableRequest {
             name: name.into(),
             location: location.into(),
             format: format.into(),
             options,
-            catalog: String::new(),
-            schema: String::new(),
+            catalog: catalog.into(),
+            schema: schema.into(),
         })
         .await?
         .into_inner()

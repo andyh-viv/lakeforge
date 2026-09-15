@@ -13,6 +13,8 @@ pub mod keys {
     pub const ADAPTIVE_COALESCE_TARGET_BYTES: &str = "forge.sql.adaptive.coalesceTargetBytes";
     pub const SPECULATION_ENABLED: &str = "forge.speculation.enabled";
     pub const MEMORY_LIMIT_BYTES: &str = "forge.memory.limitBytes";
+    pub const DEFAULT_CATALOG: &str = "forge.sql.defaultCatalog";
+    pub const DEFAULT_SCHEMA: &str = "forge.sql.defaultSchema";
 
     /// Spark aliases mapped to Forge keys.
     pub fn normalize(key: &str) -> &str {
@@ -21,6 +23,8 @@ pub mod keys {
             "spark.sql.adaptive.enabled" => ADAPTIVE_ENABLED,
             "spark.task.maxFailures" => TASK_MAX_RETRIES,
             "spark.speculation" => SPECULATION_ENABLED,
+            "spark.sql.defaultCatalog" | "spark.databricks.sql.initial.catalog.name" => DEFAULT_CATALOG,
+            "spark.sql.defaultSchema" => DEFAULT_SCHEMA,
             other => other,
         }
     }
@@ -36,6 +40,8 @@ pub struct SessionSettings {
     pub adaptive_coalesce_target_bytes: u64,
     pub speculation_enabled: bool,
     pub memory_limit_bytes: Option<u64>,
+    pub default_catalog: Option<String>,
+    pub default_schema: Option<String>,
 }
 
 impl Default for SessionSettings {
@@ -49,11 +55,40 @@ impl Default for SessionSettings {
             adaptive_coalesce_target_bytes: 64 * 1024 * 1024,
             speculation_enabled: false,
             memory_limit_bytes: None,
+            default_catalog: None,
+            default_schema: None,
         }
     }
 }
 
 impl SessionSettings {
+    /// Defaults overridden by `FORGE_CONF_<KEY>` environment variables, where
+    /// `KEY` is the setting name upper-cased with dots replaced by `_`
+    /// (e.g. `FORGE_CONF_FORGE_SQL_SHUFFLE_PARTITIONS=32`).
+    pub fn from_env() -> Self {
+        let mut s = Self::default();
+        for (k, v) in std::env::vars() {
+            if let Some(rest) = k.strip_prefix("FORGE_CONF_") {
+                let key = rest.to_ascii_lowercase().replace('_', ".");
+                let key = match key.as_str() {
+                    "forge.sql.shuffle.partitions" => keys::SHUFFLE_PARTITIONS,
+                    "forge.sql.execution.batchsize" => keys::BATCH_SIZE,
+                    "forge.sql.files.targetpartitions" => keys::TARGET_PARTITIONS,
+                    "forge.task.maxretries" => keys::TASK_MAX_RETRIES,
+                    "forge.sql.adaptive.enabled" => keys::ADAPTIVE_ENABLED,
+                    "forge.sql.adaptive.coalescetargetbytes" => keys::ADAPTIVE_COALESCE_TARGET_BYTES,
+                    "forge.speculation.enabled" => keys::SPECULATION_ENABLED,
+                    "forge.memory.limitbytes" => keys::MEMORY_LIMIT_BYTES,
+                    "forge.sql.defaultcatalog" => keys::DEFAULT_CATALOG,
+                    "forge.sql.defaultschema" => keys::DEFAULT_SCHEMA,
+                    other => other,
+                };
+                s.apply(key, &v);
+            }
+        }
+        s
+    }
+
     /// Build from a key/value map (Spark aliases accepted).
     pub fn from_map<'a, I>(pairs: I) -> Self
     where
@@ -98,6 +133,8 @@ impl SessionSettings {
                 self.speculation_enabled = value.eq_ignore_ascii_case("true")
             }
             keys::MEMORY_LIMIT_BYTES => self.memory_limit_bytes = value.parse().ok(),
+            keys::DEFAULT_CATALOG => self.default_catalog = Some(value.to_string()).filter(|v| !v.is_empty()),
+            keys::DEFAULT_SCHEMA => self.default_schema = Some(value.to_string()).filter(|v| !v.is_empty()),
             _ => {}
         }
     }
@@ -114,6 +151,12 @@ impl SessionSettings {
             self.adaptive_coalesce_target_bytes.to_string(),
         );
         m.insert(keys::SPECULATION_ENABLED.into(), self.speculation_enabled.to_string());
+        if let Some(c) = &self.default_catalog {
+            m.insert(keys::DEFAULT_CATALOG.into(), c.clone());
+        }
+        if let Some(c) = &self.default_schema {
+            m.insert(keys::DEFAULT_SCHEMA.into(), c.clone());
+        }
         if let Some(b) = self.memory_limit_bytes {
             m.insert(keys::MEMORY_LIMIT_BYTES.into(), b.to_string());
         }
