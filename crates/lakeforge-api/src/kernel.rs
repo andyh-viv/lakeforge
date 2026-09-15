@@ -78,6 +78,8 @@ impl KernelManager {
         cmd.arg("-u")
             .arg(&self.script_path)
             .env("LAKEFORGE_URL", &self.public_url)
+            .env("LAKEFORGE_HOST", &self.public_url)
+            .env("DATABRICKS_HOST", &self.public_url)
             .env("LAKEFORGE_CONTEXT_ID", context_id)
             .env("PYTHONUNBUFFERED", "1")
             .envs(env)

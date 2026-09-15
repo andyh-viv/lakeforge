@@ -96,7 +96,8 @@ impl AppState {
         let id = uuid::Uuid::new_v4().simple().to_string();
         let token = self.auth.issue_jwt(&p.user_id, &p.user_name, 12 * 3600)?;
         let mut env = HashMap::new();
-        env.insert("LAKEFORGE_TOKEN".to_string(), token);
+        env.insert("LAKEFORGE_TOKEN".to_string(), token.clone());
+        env.insert("DATABRICKS_TOKEN".to_string(), token);
         env.insert("LAKEFORGE_CLUSTER_ID".to_string(), cluster_id.to_string());
         env.insert("LAKEFORGE_DRIVER_ADDR".to_string(), driver);
         env.insert("LAKEFORGE_USER".to_string(), p.user_name.clone());
