@@ -88,7 +88,7 @@ impl DriverServer {
     async fn prepare_tables(&self, ctx: &SessionContext, sql: &str, warehouse_dir: Option<&str>) -> DFResult<()> {
         let Some(dir) = warehouse_dir else { return Ok(()) };
         let state = ctx.state();
-        let dialect = state.config().options().sql_parser.dialect.clone();
+        let dialect = state.config().options().sql_parser.dialect;
         let Ok(stmt) = state.sql_to_statement(sql, &dialect) else { return Ok(()) };
         let refs = state.resolve_table_references(&stmt)?;
         for r in refs {

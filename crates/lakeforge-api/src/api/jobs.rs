@@ -314,6 +314,7 @@ impl AppState {
     }
 
     /// Materialise a run from job settings (or a one-time submit payload).
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_run(&self, p: &Principal, job: Option<&Job>, settings: &Map<String, Value>, trigger: &str, run_type: &str, overrides: Map<String, Value>, notebook_params: Map<String, Value>, parent_run_id: Option<i64>) -> ApiResult<Run> {
         let run_id = self.store.next_seq("run_id").await?;
         let tasks_def = settings.get("tasks").and_then(|v| v.as_array()).cloned().unwrap_or_default();
@@ -867,7 +868,7 @@ impl AppState {
             }
             if let Some(fa) = job.settings.get("trigger").and_then(|t| t.get("file_arrival")).cloned() {
                 let url = fa["url"].as_str().unwrap_or("");
-                let path = self.storage.path_of(url).or_else(|| url.strip_prefix("dbfs:").map(|p| super::dbfs::dbfs_path(p))).unwrap_or_else(|| url.to_string());
+                let path = self.storage.path_of(url).or_else(|| url.strip_prefix("dbfs:").map(super::dbfs::dbfs_path)).unwrap_or_else(|| url.to_string());
                 let min_gap = fa["min_time_between_triggers_seconds"].as_i64().unwrap_or(0) * 1000;
                 let last_fired = job.trigger_state.get("last_fired_ms").and_then(|v| v.as_i64()).unwrap_or(0);
                 let seen = job.trigger_state.get("last_seen_ms").and_then(|v| v.as_i64());
@@ -1223,7 +1224,7 @@ async fn list_runs(State(st): State<S>, Query(q): Query<ListRunsQ>) -> ApiResult
             && q.start_time_from.map(|t| r.start_time >= t).unwrap_or(true)
             && q.start_time_to.map(|t| r.start_time <= t).unwrap_or(true)
     });
-    docs.sort_by(|a, b| b.data.start_time.cmp(&a.data.start_time));
+    docs.sort_by_key(|d| std::cmp::Reverse(d.data.start_time));
     let total = docs.len() as i64;
     let expand = q.expand_tasks.unwrap_or(false);
     let page: Vec<Value> = docs

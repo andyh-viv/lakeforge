@@ -15,10 +15,38 @@ pub struct KubernetesBackend {
     namespace: String,
     default_image: String,
     service_account: Option<String>,
+    pod_labels: Vec<(String, String)>,
+    node_selector: Vec<(String, String)>,
+    extra_env: Vec<(String, String)>,
+}
+
+/// Parses `k1=v1,k2=v2` (surrounding whitespace ignored, empty entries skipped).
+fn parse_kv_list(raw: &str) -> Vec<(String, String)> {
+    raw.split(',')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            let k = k.trim();
+            (!k.is_empty()).then(|| (k.to_string(), v.trim().to_string()))
+        })
+        .collect()
+}
+
+fn env_kv_list(name: &str) -> Vec<(String, String)> {
+    std::env::var(name).map(|v| parse_kv_list(&v)).unwrap_or_default()
 }
 
 const DRIVER_PORT: i32 = 50051;
 const EXECUTOR_PORT: i32 = 50052;
+
+/// Role-specific parameters for a driver or executor Deployment.
+struct PodRole<'a> {
+    role: &'a str,
+    name: &'a str,
+    replicas: u32,
+    args: Vec<String>,
+    mem_mb: u64,
+    extra_env: &'a [(&'a str, String)],
+}
 
 impl KubernetesBackend {
     pub async fn from_env() -> Result<Self> {
@@ -28,6 +56,9 @@ impl KubernetesBackend {
             default_image: std::env::var("LAKEFORGE_FORGE_IMAGE")
                 .unwrap_or_else(|_| "ghcr.io/lakeforge/forge:latest".into()),
             service_account: std::env::var("LAKEFORGE_K8S_SERVICE_ACCOUNT").ok(),
+            pod_labels: env_kv_list("LAKEFORGE_FORGE_POD_LABELS"),
+            node_selector: env_kv_list("LAKEFORGE_FORGE_NODE_SELECTOR"),
+            extra_env: env_kv_list("LAKEFORGE_FORGE_ENV"),
             client,
         })
     }
@@ -41,12 +72,14 @@ impl KubernetesBackend {
         json!({ "app.kubernetes.io/name": "forge", "lakeforge.io/cluster": id, "lakeforge.io/role": role })
     }
 
-    fn env_json(spec: &LaunchSpec, extra: &[(&str, String)]) -> serde_json::Value {
-        let mut v: Vec<serde_json::Value> = spec
-            .env
+    fn env_json(&self, spec: &LaunchSpec, extra: &[(&str, String)]) -> serde_json::Value {
+        let mut v: Vec<serde_json::Value> = self
+            .extra_env
             .iter()
+            .filter(|(k, _)| !spec.env.contains_key(k))
             .map(|(k, val)| json!({ "name": k, "value": val }))
             .collect();
+        v.extend(spec.env.iter().map(|(k, val)| json!({ "name": k, "value": val })));
         for (k, val) in spec.conf.iter().map(|(k, v)| (format!("FORGE_CONF_{}", k.replace('.', "_").to_uppercase()), v.clone())) {
             v.push(json!({ "name": k, "value": val }));
         }
@@ -58,8 +91,13 @@ impl KubernetesBackend {
         serde_json::Value::Array(v)
     }
 
-    fn deployment(&self, spec: &LaunchSpec, role: &str, name: &str, replicas: u32, args: Vec<String>, mem_mb: u64, extra_env: &[(&str, String)]) -> Deployment {
+    fn deployment(&self, spec: &LaunchSpec, pod: PodRole<'_>) -> Deployment {
+        let PodRole { role, name, replicas, args, mem_mb, extra_env } = pod;
         let labels = Self::labels(&spec.cluster_id, role);
+        let mut pod_labels = labels.clone();
+        for (k, v) in &self.pod_labels {
+            pod_labels[k] = json!(v);
+        }
         let image = spec.image.clone().unwrap_or_else(|| self.default_image.clone());
         let port = if role == "driver" { DRIVER_PORT } else { EXECUTOR_PORT };
         let mut pod_spec = json!({
@@ -67,7 +105,7 @@ impl KubernetesBackend {
                 "name": "forge",
                 "image": image,
                 "args": args,
-                "env": Self::env_json(spec, extra_env),
+                "env": self.env_json(spec, extra_env),
                 "ports": [{ "containerPort": port, "name": "grpc" }],
                 "resources": {
                     "requests": { "memory": format!("{mem_mb}Mi"), "cpu": if role == "driver" { "500m".to_string() } else { spec.slots_per_worker.max(1).to_string() } },
@@ -80,6 +118,9 @@ impl KubernetesBackend {
         if let Some(sa) = &self.service_account {
             pod_spec["serviceAccountName"] = json!(sa);
         }
+        if !self.node_selector.is_empty() {
+            pod_spec["nodeSelector"] = self.node_selector.iter().map(|(k, v)| (k.clone(), json!(v))).collect::<serde_json::Map<_, _>>().into();
+        }
         serde_json::from_value(json!({
             "apiVersion": "apps/v1",
             "kind": "Deployment",
@@ -87,7 +128,7 @@ impl KubernetesBackend {
             "spec": {
                 "replicas": replicas,
                 "selector": { "matchLabels": labels },
-                "template": { "metadata": { "labels": labels }, "spec": pod_spec }
+                "template": { "metadata": { "labels": pod_labels }, "spec": pod_spec }
             }
         }))
         .expect("valid deployment")
@@ -108,21 +149,26 @@ impl ClusterBackend for KubernetesBackend {
 
         let driver = self.deployment(
             spec,
-            "driver",
-            &driver_name,
-            1,
-            vec!["driver".into(), "--bind".into(), format!("0.0.0.0:{DRIVER_PORT}"), "--no-local-fallback".into()],
-            spec.driver_memory_mb,
-            &[],
+            PodRole {
+                role: "driver",
+                name: &driver_name,
+                replicas: 1,
+                args: vec!["driver".into(), "--bind".into(), format!("0.0.0.0:{DRIVER_PORT}"), "--no-local-fallback".into()],
+                mem_mb: spec.driver_memory_mb,
+                extra_env: &[],
+            },
         );
+        let exec_env = [("FORGE_DRIVER_ADDR", driver_addr.clone()), ("FORGE_MEMORY_LIMIT_MB", spec.worker_memory_mb.to_string())];
         let execs = self.deployment(
             spec,
-            "executor",
-            &exec_name,
-            spec.num_workers,
-            vec!["executor".into(), "--bind".into(), format!("0.0.0.0:{EXECUTOR_PORT}"), "--slots".into(), spec.slots_per_worker.to_string()],
-            spec.worker_memory_mb,
-            &[("FORGE_DRIVER_ADDR", driver_addr.clone()), ("FORGE_MEMORY_LIMIT_MB", spec.worker_memory_mb.to_string())],
+            PodRole {
+                role: "executor",
+                name: &exec_name,
+                replicas: spec.num_workers,
+                args: vec!["executor".into(), "--bind".into(), format!("0.0.0.0:{EXECUTOR_PORT}"), "--slots".into(), spec.slots_per_worker.to_string()],
+                mem_mb: spec.worker_memory_mb,
+                extra_env: &exec_env,
+            },
         );
         let svc: Service = serde_json::from_value(json!({
             "apiVersion": "v1",

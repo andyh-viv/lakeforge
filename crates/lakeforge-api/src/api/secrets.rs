@@ -64,7 +64,7 @@ impl AppState {
         let ok = match need {
             "READ" => mine.iter().any(|m| matches!(*m, "READ" | "WRITE" | "MANAGE")),
             "WRITE" => mine.iter().any(|m| matches!(*m, "WRITE" | "MANAGE")),
-            _ => mine.iter().any(|m| *m == "MANAGE"),
+            _ => mine.contains(&"MANAGE"),
         };
         if ok {
             Ok(())

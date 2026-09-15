@@ -389,7 +389,7 @@ pub fn parse_source(text: &str, language: Language) -> Notebook {
 /// `%sql select 1` -> ("sql", "select 1"); unknown magics stay in source.
 pub fn split_magic(src: &str, default: Language) -> (String, String) {
     let first = src.lines().next().unwrap_or("").trim();
-    let rest = src.splitn(2, '\n').nth(1).unwrap_or("");
+    let rest = src.split_once('\n').map(|x| x.1).unwrap_or("");
     let magic = first.strip_prefix('%').map(|m| m.split_whitespace().next().unwrap_or("")).unwrap_or("");
     match magic {
         "sql" => ("sql".into(), rest.to_string()),

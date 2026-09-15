@@ -42,6 +42,7 @@ pub struct Dataset {
 /// Parse DLT SQL declarations out of a script.
 pub fn parse_datasets(sql: &str, source: &str) -> Vec<Dataset> {
     let re = regex::Regex::new(r"(?is)CREATE\s+(?:OR\s+REFRESH\s+|OR\s+REPLACE\s+)?(?:TEMPORARY\s+)?(STREAMING\s+(?:LIVE\s+)?TABLE|LIVE\s+TABLE|MATERIALIZED\s+VIEW|LIVE\s+VIEW|STREAMING\s+TABLE|TABLE|VIEW)\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_][\w\.]*|`[^`]+`)\s*(\([^)]*\))?\s*(?:COMMENT\s+'([^']*)')?\s*(?:TBLPROPERTIES\s*\([^)]*\))?\s*(?:PARTITIONED\s+BY\s*\([^)]*\))?\s*AS\s+").unwrap();
+    let dep_re = regex::Regex::new(r"(?i)\b(?:LIVE|STREAM)\s*\(?\s*(?:LIVE\.)?([A-Za-z_][\w]*)\s*\)?|\bLIVE\.([A-Za-z_][\w]*)").unwrap();
     let mut out = vec![];
     for stmt in super::sql::split_statements(sql) {
         let Some(m) = re.captures(&stmt) else { continue };
@@ -54,7 +55,6 @@ pub fn parse_datasets(sql: &str, source: &str) -> Vec<Dataset> {
         };
         let name = m[2].trim_matches('`').rsplit('.').next().unwrap_or("").to_string();
         let query = stmt[m.get(0).unwrap().end()..].trim().trim_end_matches(';').to_string();
-        let dep_re = regex::Regex::new(r"(?i)\b(?:LIVE|STREAM)\s*\(?\s*(?:LIVE\.)?([A-Za-z_][\w]*)\s*\)?|\bLIVE\.([A-Za-z_][\w]*)").unwrap();
         let mut deps: Vec<String> = dep_re.captures_iter(&query).filter_map(|c| c.get(1).or(c.get(2)).map(|x| x.as_str().to_string())).collect();
         deps.sort();
         deps.dedup();
@@ -243,6 +243,7 @@ impl AppState {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_pipeline_on(self: &Arc<Self>, p: &Principal, pipe: &Value, pipeline_id: &str, update_id: &str, target: &str, cluster_id: &str, full_refresh: bool) -> ApiResult<()> {
         self.cluster_driver(cluster_id, true).await?;
         self.set_update_state(update_id, "INITIALIZING", None).await?;

@@ -2,7 +2,7 @@
 //! processes of the control plane using the `forge` binary.
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -38,7 +38,7 @@ impl LocalProcessBackend {
         Self { forge_bin, work_root, host: "127.0.0.1".into() }
     }
 
-    fn spawn(&self, args: &[String], env: &std::collections::BTreeMap<String, String>, log: &PathBuf) -> Result<u32> {
+    fn spawn(&self, args: &[String], env: &std::collections::BTreeMap<String, String>, log: &Path) -> Result<u32> {
         let out = std::fs::File::create(log)?;
         let err = out.try_clone()?;
         let mut cmd = Command::new(&self.forge_bin);
@@ -60,7 +60,7 @@ impl LocalProcessBackend {
         spec: &LaunchSpec,
         idx: usize,
         driver_port: u16,
-        work_dir: &PathBuf,
+        work_dir: &Path,
     ) -> Result<(u32, u16)> {
         let port = free_port()?;
         let id = format!("{}-exec-{idx}", &spec.cluster_id[..spec.cluster_id.len().min(8)]);

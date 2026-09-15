@@ -664,11 +664,11 @@ async fn forge_status(State(st): State<S>, Query(q): Query<IdQuery>) -> ApiResul
         "driver": { "id": status.driver_id, "uptime_ms": status.uptime_ms, "version": status.version, "total_slots": status.total_slots, "free_slots": status.free_slots, "running_jobs": status.running_jobs },
         "executors": execs.executors.iter().map(|e| {
             let m = e.metadata.clone().unwrap_or_default();
-            let r = e.resources.clone().unwrap_or_default();
+            let r = e.resources.unwrap_or_default();
             json!({ "id": m.id, "host": m.host, "port": m.port, "slots": m.task_slots, "free_slots": r.free_task_slots, "memory_bytes": r.total_memory_bytes, "cpu_cores": r.cpu_cores, "running": e.running_tasks, "completed": e.completed_tasks, "failed": e.failed_tasks, "last_heartbeat_ms": e.last_heartbeat_ms })
         }).collect::<Vec<_>>(),
         "jobs": jobs.iter().map(|j| {
-            let p = j.progress.clone().unwrap_or_default();
+            let p = j.progress.unwrap_or_default();
             json!({ "job_id": j.job_id, "sql": j.sql, "state": j.state, "stages_total": p.total_stages, "stages_done": p.completed_stages, "tasks_total": p.total_tasks, "tasks_done": p.completed_tasks, "tasks_running": p.running_tasks, "tasks_failed": p.failed_tasks, "submitted_ms": j.submitted_ms, "finished_ms": j.finished_ms, "error": j.error })
         }).collect::<Vec<_>>(),
     })))
