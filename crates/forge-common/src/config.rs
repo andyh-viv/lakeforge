@@ -15,6 +15,8 @@ pub mod keys {
     pub const MEMORY_LIMIT_BYTES: &str = "forge.memory.limitBytes";
     pub const DEFAULT_CATALOG: &str = "forge.sql.defaultCatalog";
     pub const DEFAULT_SCHEMA: &str = "forge.sql.defaultSchema";
+    /// Root under which managed tables are written (`<root>/<catalog>/<schema>/<table>`).
+    pub const WAREHOUSE_DIR: &str = "forge.sql.warehouse.dir";
 
     /// Spark aliases mapped to Forge keys.
     pub fn normalize(key: &str) -> &str {
@@ -25,6 +27,7 @@ pub mod keys {
             "spark.speculation" => SPECULATION_ENABLED,
             "spark.sql.defaultCatalog" | "spark.databricks.sql.initial.catalog.name" => DEFAULT_CATALOG,
             "spark.sql.defaultSchema" => DEFAULT_SCHEMA,
+            "spark.sql.warehouse.dir" => WAREHOUSE_DIR,
             other => other,
         }
     }
@@ -42,6 +45,7 @@ pub struct SessionSettings {
     pub memory_limit_bytes: Option<u64>,
     pub default_catalog: Option<String>,
     pub default_schema: Option<String>,
+    pub warehouse_dir: Option<String>,
 }
 
 impl Default for SessionSettings {
@@ -57,6 +61,7 @@ impl Default for SessionSettings {
             memory_limit_bytes: None,
             default_catalog: None,
             default_schema: None,
+            warehouse_dir: None,
         }
     }
 }
@@ -135,6 +140,7 @@ impl SessionSettings {
             keys::MEMORY_LIMIT_BYTES => self.memory_limit_bytes = value.parse().ok(),
             keys::DEFAULT_CATALOG => self.default_catalog = Some(value.to_string()).filter(|v| !v.is_empty()),
             keys::DEFAULT_SCHEMA => self.default_schema = Some(value.to_string()).filter(|v| !v.is_empty()),
+            keys::WAREHOUSE_DIR => self.warehouse_dir = Some(value.to_string()).filter(|v| !v.is_empty()),
             _ => {}
         }
     }
@@ -156,6 +162,9 @@ impl SessionSettings {
         }
         if let Some(c) = &self.default_schema {
             m.insert(keys::DEFAULT_SCHEMA.into(), c.clone());
+        }
+        if let Some(c) = &self.warehouse_dir {
+            m.insert(keys::WAREHOUSE_DIR.into(), c.clone());
         }
         if let Some(b) = self.memory_limit_bytes {
             m.insert(keys::MEMORY_LIMIT_BYTES.into(), b.to_string());

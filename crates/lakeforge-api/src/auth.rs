@@ -31,7 +31,7 @@ pub struct User {
     pub user_name: String,
     #[serde(default)]
     pub display_name: String,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub password_hash: Option<String>,
     #[serde(default = "default_true")]
     pub active: bool,
@@ -65,7 +65,6 @@ pub struct Token {
     pub created_by_username: String,
     pub creation_time: i64,
     pub expiry_time: i64,
-    #[serde(skip_serializing)]
     pub hash: String,
     #[serde(default)]
     pub owner_id: String,
@@ -292,6 +291,15 @@ impl AppState {
             tracing::warn!(user = %name, "created initial admin user; change the password via LAKEFORGE_ADMIN_PASSWORD");
         }
         Ok(())
+    }
+
+    /// Principal for the configured workspace admin (used for first-boot provisioning).
+    pub async fn admin_principal(&self) -> ApiResult<Principal> {
+        let doc = self
+            .user_by_name(&self.config.admin_user)
+            .await?
+            .ok_or_else(|| ApiError::internal("admin user missing"))?;
+        self.principal_for_user(&doc).await
     }
 }
 

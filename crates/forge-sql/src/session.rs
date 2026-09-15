@@ -11,6 +11,7 @@ use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::datasource::physical_plan::FileScanConfig;
 use datafusion::error::Result as DFResult;
+use deltalake::delta_datafusion::planner::DeltaPlanner;
 use deltalake::delta_datafusion::DeltaTableFactory;
 use forge_common::config::SessionSettings;
 
@@ -102,6 +103,7 @@ impl ForgeSessionBuilder {
             .with_config(config)
             .with_runtime_env(self.runtime_env())
             .with_default_features()
+            .with_query_planner(DeltaPlanner::new())
             .with_table_factory("DELTA".into(), Arc::new(DeltaTableFactory {}));
         if let Some(c) = &self.catalogs {
             b = b.with_catalog_list(Arc::clone(c));

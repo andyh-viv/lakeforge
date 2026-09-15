@@ -52,14 +52,15 @@ pub fn now_ms() -> i64 {
 
 const SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS docs (
-        id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
+        id TEXT NOT NULL,
         workspace_id TEXT NOT NULL,
         parent_id TEXT,
         name TEXT,
         data TEXT NOT NULL,
         created_at BIGINT NOT NULL,
-        updated_at BIGINT NOT NULL
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (kind, id)
     )",
     "CREATE INDEX IF NOT EXISTS docs_kind_ws ON docs (kind, workspace_id, parent_id, name)",
     "CREATE INDEX IF NOT EXISTS docs_kind_created ON docs (kind, workspace_id, created_at)",

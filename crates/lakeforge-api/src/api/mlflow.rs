@@ -577,7 +577,8 @@ struct LogMetric {
     run_uuid: Option<String>,
     key: String,
     value: Value,
-    timestamp: i64,
+    #[serde(default)]
+    timestamp: Option<i64>,
     #[serde(default)]
     step: i64,
 }
@@ -597,7 +598,7 @@ fn metric_value(v: &Value) -> f64 {
 
 async fn log_metric(State(st): State<S>, Body(b): Body<LogMetric>) -> ApiResult<Json<Value>> {
     let id = b.run_id.clone().or(b.run_uuid.clone()).ok_or_else(|| ApiError::invalid("run_id is required"))?;
-    let m = Metric { key: b.key, value: metric_value(&b.value), timestamp: b.timestamp, step: b.step };
+    let m = Metric { key: b.key, value: metric_value(&b.value), timestamp: b.timestamp.unwrap_or_else(now_ms), step: b.step };
     log_batch_impl(&st, &id, vec![m], vec![], vec![]).await?;
     Ok(empty())
 }
@@ -653,7 +654,8 @@ struct LogBatch {
 struct LogMetricItem {
     key: String,
     value: Value,
-    timestamp: i64,
+    #[serde(default)]
+    timestamp: Option<i64>,
     #[serde(default)]
     step: i64,
 }
@@ -698,7 +700,7 @@ async fn log_batch_impl(st: &AppState, run_id: &str, metrics: Vec<Metric>, param
 }
 
 async fn log_batch(State(st): State<S>, Body(b): Body<LogBatch>) -> ApiResult<Json<Value>> {
-    let metrics = b.metrics.into_iter().map(|m| Metric { key: m.key, value: metric_value(&m.value), timestamp: m.timestamp, step: m.step }).collect();
+    let metrics = b.metrics.into_iter().map(|m| Metric { key: m.key, value: metric_value(&m.value), timestamp: m.timestamp.unwrap_or_else(now_ms), step: m.step }).collect();
     log_batch_impl(&st, &b.run_id, metrics, b.params, b.tags).await?;
     Ok(empty())
 }

@@ -284,7 +284,7 @@ impl AppState {
 
     pub async fn save_job(&self, j: &Job) -> ApiResult<()> {
         let name = j.settings.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
-        self.store.put(KIND_JOB, &j.job_id.to_string(), None, name.as_deref(), j).await
+        self.store.upsert(KIND_JOB, self.ws(), &j.job_id.to_string(), None, name.as_deref(), j).await
     }
 
     pub async fn get_run(&self, id: i64) -> ApiResult<Doc<Run>> {
@@ -292,7 +292,9 @@ impl AppState {
     }
 
     pub async fn save_run(&self, r: &Run) -> ApiResult<()> {
-        self.store.put(KIND_RUN, &r.run_id.to_string(), r.job_id.map(|j| j.to_string()).as_deref(), Some(&r.run_name), r).await
+        self.store
+            .upsert(KIND_RUN, self.ws(), &r.run_id.to_string(), r.job_id.map(|j| j.to_string()).as_deref(), Some(&r.run_name), r)
+            .await
     }
 
     /// Task-run id -> parent run (for `runs/get-output`).
@@ -700,9 +702,13 @@ impl AppState {
                 let warehouse_id = sq["warehouse_id"].as_str();
                 let params: HashMap<String, String> = sq["parameters"].as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), value_str(v))).collect()).unwrap_or_default();
                 let sql_text = if let Some(q) = sq.get("query") {
-                    let qid = q["query_id"].as_str().ok_or_else(|| ApiError::invalid("sql_task.query.query_id is required"))?;
-                    let doc = self.store.require::<Value>(super::sql::KIND_QUERY, qid, "Query").await?;
-                    doc.data["query_text"].as_str().unwrap_or("").to_string()
+                    if let Some(text) = q["query_text"].as_str() {
+                        text.to_string()
+                    } else {
+                        let qid = q["query_id"].as_str().ok_or_else(|| ApiError::invalid("sql_task.query.query_id (or query_text) is required"))?;
+                        let doc = self.store.require::<Value>(super::sql::KIND_QUERY, qid, "Query").await?;
+                        doc.data["query_text"].as_str().unwrap_or("").to_string()
+                    }
                 } else if let Some(f) = sq.get("file") {
                     let path = f["path"].as_str().ok_or_else(|| ApiError::invalid("sql_task.file.path is required"))?;
                     self.read_text_any(path).await?

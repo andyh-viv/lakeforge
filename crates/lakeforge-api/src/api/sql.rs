@@ -436,31 +436,54 @@ impl AppState {
     }
 }
 
-async fn create_warehouse(State(st): State<S>, Who(p): Who, Body(mut o): Body<Map<String, Value>>) -> ApiResult<Json<Value>> {
-    let name = o.get("name").and_then(|v| v.as_str()).ok_or_else(|| ApiError::invalid("name is required"))?.to_string();
-    let size = o.get("cluster_size").and_then(|v| v.as_str()).unwrap_or("2X-Small").to_string();
-    let (workers, node) = size_shape(&size);
-    let auto_stop = o.get("auto_stop_mins").and_then(|v| v.as_u64()).unwrap_or(45) as u32;
-    let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
+impl AppState {
+    /// Create a SQL warehouse and its backing Forge cluster; returns the warehouse id.
+    pub async fn create_warehouse(self: &Arc<Self>, p: &Principal, mut o: Map<String, Value>, autostart: bool) -> ApiResult<String> {
+        let st = self;
+        let name = o.get("name").and_then(|v| v.as_str()).ok_or_else(|| ApiError::invalid("name is required"))?.to_string();
+        let size = o.get("cluster_size").and_then(|v| v.as_str()).unwrap_or("2X-Small").to_string();
+        let (workers, node) = size_shape(&size);
+        let auto_stop = o.get("auto_stop_mins").and_then(|v| v.as_u64()).unwrap_or(45) as u32;
+        let id = uuid::Uuid::new_v4().simple().to_string()[..16].to_string();
 
-    // backing cluster
-    let cluster_body = json!({
-        "cluster_name": format!("sql-warehouse-{name}"),
-        "num_workers": workers,
-        "node_type_id": node,
-        "autotermination_minutes": auto_stop,
-        "cluster_source": "SQL",
-        "custom_tags": { "LakeforgeWarehouseId": id, "ResourceClass": "SQLWarehouse" },
-        "spark_conf": { "forge.sql.shuffle.partitions": (workers.max(1) * 4).to_string() },
-    });
-    let cluster_id = st.create_cluster_from_json(&p, cluster_body.as_object().unwrap().clone(), true).await?;
+        let cluster_body = json!({
+            "cluster_name": format!("sql-warehouse-{name}"),
+            "num_workers": workers,
+            "node_type_id": node,
+            "autotermination_minutes": auto_stop,
+            "cluster_source": "SQL",
+            "custom_tags": { "LakeforgeWarehouseId": id, "ResourceClass": "SQLWarehouse" },
+            "spark_conf": { "forge.sql.shuffle.partitions": (workers.max(1) * 4).to_string() },
+        });
+        let cluster_id = st.create_cluster_from_json(p, cluster_body.as_object().unwrap().clone(), autostart).await?;
 
-    o.insert("id".into(), json!(id));
-    o.insert("cluster_id".into(), json!(cluster_id));
-    o.insert("creator_name".into(), json!(p.user_name));
-    o.insert("cluster_size".into(), json!(size));
-    let wh: Warehouse = serde_json::from_value(Value::Object(o)).map_err(|e| ApiError::invalid(format!("invalid warehouse spec: {e}")))?;
-    st.store.insert(KIND_WAREHOUSE, st.ws(), &id, None, Some(&name), &wh).await?;
+        o.insert("id".into(), json!(id));
+        o.insert("cluster_id".into(), json!(cluster_id));
+        o.insert("creator_name".into(), json!(p.user_name));
+        o.insert("cluster_size".into(), json!(size));
+        let wh: Warehouse = serde_json::from_value(Value::Object(o)).map_err(|e| ApiError::invalid(format!("invalid warehouse spec: {e}")))?;
+        st.store.insert(KIND_WAREHOUSE, st.ws(), &id, None, Some(&name), &wh).await?;
+        Ok(id)
+    }
+
+    /// First-boot default: a small "Starter Warehouse" so SQL works out of the box.
+    pub async fn ensure_starter_warehouse(self: &Arc<Self>, p: &Principal) -> ApiResult<()> {
+        let docs: Vec<Doc<Warehouse>> = self.store.list(KIND_WAREHOUSE, self.ws(), Filter { limit: Some(1), ..Default::default() }).await?;
+        if docs.is_empty() {
+            let mut o = Map::new();
+            o.insert("name".into(), json!("Starter Warehouse"));
+            o.insert("cluster_size".into(), json!("2X-Small"));
+            o.insert("auto_stop_mins".into(), json!(10));
+            o.insert("warehouse_type".into(), json!("PRO"));
+            let id = self.create_warehouse(p, o, false).await?;
+            tracing::info!(warehouse = %id, "created starter SQL warehouse");
+        }
+        Ok(())
+    }
+}
+
+async fn create_warehouse(State(st): State<S>, Who(p): Who, Body(o): Body<Map<String, Value>>) -> ApiResult<Json<Value>> {
+    let id = st.create_warehouse(&p, o, true).await?;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -611,7 +634,7 @@ async fn upsert_query(st: &AppState, p: &Principal, id: Option<String>, o: Map<S
     base.insert("update_time".into(), json!(now));
     let name = base["display_name"].as_str().unwrap_or("").to_string();
     let v = Value::Object(base);
-    st.store.put(KIND_QUERY, &id, None, Some(&name), &v).await?;
+    st.store.upsert(KIND_QUERY, st.ws(), &id, None, Some(&name), &v).await?;
     Ok(v)
 }
 
@@ -744,7 +767,7 @@ async fn upsert_alert(st: &AppState, p: &Principal, id: Option<String>, mut o: M
     base.insert("update_time".into(), json!(now));
     let name = base["display_name"].as_str().unwrap_or("").to_string();
     let v = Value::Object(base);
-    st.store.put(KIND_ALERT, &id, None, Some(&name), &v).await?;
+    st.store.upsert(KIND_ALERT, st.ws(), &id, None, Some(&name), &v).await?;
     Ok(v)
 }
 

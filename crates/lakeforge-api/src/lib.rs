@@ -36,6 +36,14 @@ pub fn router(state: Arc<AppState>) -> Router {
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let state = AppState::new(config.clone()).await?;
     workers::spawn_all(Arc::clone(&state));
+    match state.admin_principal().await {
+        Ok(admin) => {
+            if let Err(e) = state.ensure_starter_warehouse(&admin).await {
+                tracing::warn!(error = %e, "starter warehouse provisioning failed");
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "admin principal unavailable; skipping starter warehouse"),
+    }
     let app = router(Arc::clone(&state));
     let listener = tokio::net::TcpListener::bind(config.bind).await?;
     tracing::info!(bind = %config.bind, db = %redact(&config.database_url), storage = %state.storage.root_url, backend = state.backend.name(), "lakeforge control plane listening");

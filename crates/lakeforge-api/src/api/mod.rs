@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::FromRequest;
-use axum::http::StatusCode;
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{middleware, Router};
@@ -49,6 +49,18 @@ impl<T: DeserializeOwned, St: Send + Sync> FromRequest<St> for Body<T> {
             Err(e) => Err(ApiError::invalid(format!("Invalid JSON body: {}", e.body_text()))),
         }
     }
+}
+
+/// Clients (curl `-d`, some SDKs) send JSON bodies with no `Content-Type` or
+/// with `application/x-www-form-urlencoded`; treat those as JSON like
+/// Databricks does. Multipart/octet-stream uploads are untouched.
+async fn default_json_content_type(mut req: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+    let has_body_method = matches!(*req.method(), Method::POST | Method::PUT | Method::PATCH | Method::DELETE);
+    let ct = req.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    if has_body_method && (ct.is_empty() || ct.starts_with("application/x-www-form-urlencoded")) {
+        req.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
+    next.run(req).await
 }
 
 pub fn ok_json<T: serde::Serialize>(v: T) -> axum::Json<T> {
@@ -79,6 +91,7 @@ pub fn router(state: S) -> Router {
         .merge(commands::router())
         .merge(misc::router())
         .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware))
+        .layer(middleware::from_fn(default_json_content_type))
         .with_state(Arc::clone(&state));
 
     Router::new()

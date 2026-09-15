@@ -27,7 +27,7 @@ use crate::state::AppState;
 use crate::store::now_ms;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(rename_all = "PascalCase")]
 pub enum CommandStatus {
     Queued,
     Running,

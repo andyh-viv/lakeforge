@@ -204,6 +204,7 @@ impl AppState {
         let workers = c.autoscale.as_ref().map(|a| a.min_workers.max(1)).unwrap_or(c.num_workers);
         let mut conf: BTreeMap<String, String> = c.spark_conf.clone();
         conf.entry("forge.sql.shuffle.partitions".into()).or_insert_with(|| ((workers.max(1) * slots) * 2).to_string());
+        conf.entry("forge.sql.warehouse.dir".into()).or_insert_with(|| self.warehouse_dir());
         LaunchSpec {
             cluster_id: c.cluster_id.clone(),
             cluster_name: c.cluster_name.clone(),

@@ -257,14 +257,17 @@ async fn create(State(st): State<S>, Who(p): Who, Body(b): Body<CreateRepo>) -> 
     }
     let _ = git(&dir, &["config", "user.email", &p.user_name], &[]).await;
     let _ = git(&dir, &["config", "user.name", &p.user_name], &[]).await;
+    let v = json!({ "id": id, "url": b.url, "provider": b.provider.clone().unwrap_or_else(|| provider_of(&b.url).to_string()), "path": path, "branch": b.branch, "head_commit_id": "", "sparse_checkout": if patterns.is_empty() { Value::Null } else { json!({ "patterns": patterns }) }, "creator_user_name": p.user_name, "created_at": now_ms() });
+    if let Err(e) = st.store.insert(KIND_REPO, st.ws(), &id_s, Some(&p.user_name), Some(&path), &v).await {
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        return Err(e);
+    }
     // Repo root object in the workspace.
     st.ws_mkdirs(&path, &p.user_name).await?;
     let mut root = st.ws_require(&path).await?;
     root.object_type = ObjectType::Repo;
     root.repo_id = Some(id_s.clone());
     st.store.upsert(super::workspace::KIND, st.ws(), &root.path, super::workspace::parent_of(&root.path).as_deref(), Some(&root.path), &root).await?;
-    let v = json!({ "id": id, "url": b.url, "provider": b.provider.clone().unwrap_or_else(|| provider_of(&b.url).to_string()), "path": path, "branch": b.branch, "head_commit_id": "", "sparse_checkout": if patterns.is_empty() { Value::Null } else { json!({ "patterns": patterns }) }, "creator_user_name": p.user_name, "created_at": now_ms() });
-    st.store.insert(KIND_REPO, st.ws(), &id_s, Some(&p.user_name), Some(&path), &v).await?;
     let n = st.import_checkout(&p.user_name, &dir, &path, &id_s, &patterns).await?;
     tracing::info!(repo = id, files = n, %path, "repo cloned");
     let v = st.refresh_repo_meta(&id_s).await?;

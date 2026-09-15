@@ -153,6 +153,16 @@ impl AppState {
         schema.map(|s| columns_from_engine_schema(&s)).unwrap_or_default()
     }
 
+    /// Root under which Forge drivers write managed tables
+    /// (`forge.sql.warehouse.dir`); tables live at `<root>/<catalog>/<schema>/<table>`.
+    pub fn warehouse_dir(&self) -> String {
+        self.storage.url_for("/tables")
+    }
+
+    pub fn managed_table_location(&self, cat: &str, sch: &str, name: &str) -> String {
+        format!("{}/{cat}/{sch}/{name}", self.warehouse_dir())
+    }
+
     /// Observe DDL executed through the SQL path and mirror it into the metastore.
     pub async fn observe_ddl(&self, sql: &str, user: &str) {
         let Some(ddl) = parse_ddl(sql) else { return };
@@ -166,9 +176,8 @@ impl AppState {
                 o.insert("full_name".into(), json!(format!("{cat}.{sch}.{tbl}")));
                 o.insert("table_type".into(), json!(if location.is_some() { "EXTERNAL" } else { "MANAGED" }));
                 o.insert("data_source_format".into(), json!(format.unwrap_or_else(|| "DELTA".into())));
-                if let Some(l) = location {
-                    o.insert("storage_location".into(), json!(l));
-                }
+                let loc = location.unwrap_or_else(|| self.managed_table_location(&cat, &sch, &tbl));
+                o.insert("storage_location".into(), json!(loc));
                 o.insert("securable_type".into(), json!("TABLE"));
                 if let Err(e) = self.upsert_table(o, user).await {
                     tracing::warn!(error = %e, "ddl mirror failed");
@@ -217,7 +226,7 @@ impl AppState {
             v["columns"] = Value::Array(cols);
         }
         let parent = format!("{}.{}", v["catalog_name"].as_str().unwrap_or(""), v["schema_name"].as_str().unwrap_or(""));
-        self.store.put(KIND_TABLE, &id_of(KIND_TABLE, &full), Some(&parent), Some(&full), &v).await?;
+        self.store.upsert(KIND_TABLE, self.ws(), &id_of(KIND_TABLE, &full), Some(&parent), Some(&full), &v).await?;
         Ok(v)
     }
 }
@@ -616,7 +625,7 @@ async fn create_table(State(st): State<S>, Who(p): Who, Body(mut o): Body<Map<St
     o.entry("data_source_format").or_insert(json!("DELTA"));
     o.insert("securable_type".into(), json!("TABLE"));
     if o.get("table_type").and_then(|v| v.as_str()) == Some("MANAGED") && !o.contains_key("storage_location") {
-        o.insert("storage_location".into(), json!(st.storage.url_for(&format!("/tables/{cat}/{sch}/{name}"))));
+        o.insert("storage_location".into(), json!(st.managed_table_location(&cat, &sch, &name)));
     }
     if let Some(cols) = o.get_mut("columns").and_then(|c| c.as_array_mut()) {
         for (i, c) in cols.iter_mut().enumerate() {
@@ -904,7 +913,7 @@ async fn update_grants(State(st): State<S>, Path((securable_type, full)): Path<(
     }
     assignments.retain(|(_, p)| !p.is_empty());
     let v = json!({ "privilege_assignments": assignments.iter().map(|(p, privs)| json!({ "principal": p, "privileges": privs })).collect::<Vec<_>>() });
-    st.store.put(KIND_GRANTS, &id, None, Some(&key), &v).await?;
+    st.store.upsert(KIND_GRANTS, st.ws(), &id, None, Some(&key), &v).await?;
     Ok(Json(v))
 }
 
