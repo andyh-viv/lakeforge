@@ -668,11 +668,9 @@ impl AppState {
                     }
                 }
                 let res = self.run_notebook(p, path, &cluster_id, RunOptions { arguments: args, timeout, inline_context: None, scope: Some(scope.clone()), extra_env: HashMap::new() }).await?;
-                let logs = res.cells.iter().flat_map(|c| c.outputs.iter()).filter_map(|o| match o {
-                    crate::kernel::KernelEvent::Stdout { text } | crate::kernel::KernelEvent::Stderr { text } | crate::kernel::KernelEvent::Result { text } => Some(text.clone()),
-                    _ => None,
-                }).collect::<Vec<_>>().join("");
-                let output = json!({ "notebook_output": { "result": res.result, "truncated": false }, "logs": logs, "logs_truncated": false, "error": res.error, "error_trace": res.cells.last().and_then(|c| c.outputs.iter().find_map(|o| match o { crate::kernel::KernelEvent::Error { traceback, .. } => Some(traceback.join("")), _ => None })), "metadata": { "cells": res.cells.len() } });
+                let all_outputs: Vec<crate::kernel::KernelEvent> = res.cells.iter().flat_map(|c| c.outputs.iter().cloned()).collect();
+                let (logs, _, error_trace) = summarize_outputs(&all_outputs);
+                let output = json!({ "notebook_output": { "result": res.result, "truncated": false }, "logs": logs, "logs_truncated": false, "error": res.error, "error_trace": error_trace, "metadata": { "cells": res.cells.len() } });
                 let state = match res.status.as_str() {
                     "SUCCESS" => RunState::terminated("SUCCESS", ""),
                     "TIMEDOUT" => RunState::terminated("TIMEDOUT", res.error.unwrap_or_default()),

@@ -110,7 +110,7 @@ export function JobEditor({ job, onClose, onSaved }: { job?: Job; onClose: () =>
   const clusters = useQuery({ queryKey: ['clusters'], queryFn: () => api.get<{ clusters: Cluster[] }>('/api/2.0/clusters/list') })
   const warehouses = useQuery({ queryKey: ['warehouses'], queryFn: () => api.get<{ warehouses: Warehouse[] }>('/api/2.0/sql/warehouses') })
   const pipelines = useQuery({ queryKey: ['pipelines'], queryFn: () => api.get<{ statuses: Pipeline[] }>('/api/2.0/pipelines') })
-  const jobs = useQuery({ queryKey: ['jobs'], queryFn: () => api.get<{ jobs: Job[] }>('/api/2.1/jobs/list?limit=100') })
+  const jobs = useQuery({ queryKey: ['jobs'], queryFn: () => api.get<{ jobs: Job[] }>('/api/2.1/jobs/list?limit=100&expand_tasks=true') })
   const [name, setName] = useState(job?.settings.name ?? 'New job')
   const [tasks, setTasks] = useState<TaskForm[]>(job?.settings.tasks?.map(fromTask) ?? [blankTask(1)])
   const [cron, setCron] = useState(job?.settings.schedule?.quartz_cron_expression ?? '')
@@ -366,7 +366,7 @@ export default function Workflows() {
   const qc = useQueryClient()
   const [tab, setTab] = useState('jobs')
   const [creating, setCreating] = useState(sp.get('new') === '1')
-  const jobs = useQuery({ queryKey: ['jobs'], queryFn: () => api.get<{ jobs: Job[] }>('/api/2.1/jobs/list?limit=100'), refetchInterval: 10000 })
+  const jobs = useQuery({ queryKey: ['jobs'], queryFn: () => api.get<{ jobs: Job[] }>('/api/2.1/jobs/list?limit=100&expand_tasks=true'), refetchInterval: 10000 })
   const runs = useQuery({ queryKey: ['runs', 'all'], queryFn: () => api.get<{ runs: Run[] }>('/api/2.1/jobs/runs/list?limit=100&expand_tasks=true'), refetchInterval: 5000 })
   useEffect(() => {
     if (sp.get('new') === '1') setCreating(true)
