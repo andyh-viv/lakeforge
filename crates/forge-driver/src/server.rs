@@ -8,8 +8,11 @@ use std::time::{Duration, Instant};
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::ipc::writer::StreamWriter;
+use datafusion::catalog::{CatalogProvider, MemoryCatalogProvider, MemorySchemaProvider};
 use datafusion::error::{DataFusionError, Result as DFResult};
-use datafusion::logical_expr::{LogicalPlan, Statement};
+use datafusion::logical_expr::{DdlStatement, LogicalPlan, Statement};
+use datafusion::prelude::SessionContext;
+use datafusion::sql::TableReference;
 use datafusion::physical_plan::{displayable, execute_stream_partitioned, ExecutionPlan};
 use forge_common::ForgeError;
 use forge_proto::driver_service_server::DriverService;
@@ -19,7 +22,8 @@ use forge_scheduler::Scheduler;
 use forge_shuffle::codec::ForgeCodec;
 use forge_shuffle::reader::ShuffleReaderExec;
 use forge_sql::session::ensure_plan_object_stores;
-use forge_sql::{register_table, TableFormat, TableSpec};
+use forge_sql::managed::probe_managed_table;
+use forge_sql::{create_managed_table, drop_managed_table, register_table, CreateOutcome, TableFormat, TableSpec};
 use futures::{Stream, StreamExt};
 use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
@@ -33,7 +37,17 @@ pub struct DriverServer {
     config: DriverConfig,
     scheduler: Arc<Scheduler>,
     sessions: Arc<SessionManager>,
+    /// Tables registered on this driver, keyed by `catalog.schema.table`.
+    /// Used to refresh Delta snapshots after DML and to clean up managed
+    /// tables on `DROP TABLE`.
+    tables: Arc<dashmap::DashMap<String, RegisteredTable>>,
     started: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct RegisteredTable {
+    spec: TableSpec,
+    managed: bool,
 }
 
 impl DriverServer {
@@ -41,7 +55,8 @@ impl DriverServer {
         Self {
             config,
             scheduler,
-            sessions: Arc::new(SessionManager::new(Default::default())),
+            sessions: Arc::new(SessionManager::new(forge_common::config::SessionSettings::from_env())),
+            tables: Arc::new(dashmap::DashMap::new()),
             started: Instant::now(),
         }
     }
@@ -58,6 +73,48 @@ impl DriverServer {
         &self.sessions
     }
 
+    /// Fully-qualified name of the table a DML/COPY statement writes to.
+    fn touched_table(&self, ctx: &SessionContext, plan: &LogicalPlan) -> Option<String> {
+        match plan {
+            LogicalPlan::Dml(d) => Some(full_name(&forge_sql::managed::resolve(ctx, &d.table_name))),
+            _ => None,
+        }
+    }
+
+    /// Before planning, make every table referenced by `sql` visible in
+    /// `ctx`: managed tables already known to this driver are reloaded to
+    /// pick up writes from other clusters, and unknown names are probed in
+    /// the warehouse directory so tables created elsewhere resolve.
+    async fn prepare_tables(&self, ctx: &SessionContext, sql: &str, warehouse_dir: Option<&str>) -> DFResult<()> {
+        let Some(dir) = warehouse_dir else { return Ok(()) };
+        let state = ctx.state();
+        let dialect = state.config().options().sql_parser.dialect;
+        let Ok(stmt) = state.sql_to_statement(sql, &dialect) else { return Ok(()) };
+        let refs = state.resolve_table_references(&stmt)?;
+        for r in refs {
+            let resolved = forge_sql::managed::resolve(ctx, &r);
+            if resolved.schema.as_ref() == "information_schema" {
+                continue;
+            }
+            let key = full_name(&resolved);
+            if let Some(t) = self.tables.get(&key).filter(|t| t.managed).map(|t| t.spec.clone()) {
+                if let Err(e) = register_table(ctx, &t).await {
+                    tracing::warn!(table = %key, error = %e, "could not refresh managed table");
+                }
+                continue;
+            }
+            if ctx.table_exist(TableReference::from(resolved.clone()))? {
+                continue;
+            }
+            ensure_namespace(ctx, &resolved.catalog, &resolved.schema)?;
+            if let Some(spec) = probe_managed_table(ctx, dir, &resolved).await? {
+                tracing::info!(table = %key, location = %spec.location, "discovered managed table");
+                self.tables.insert(key, RegisteredTable { spec, managed: true });
+            }
+        }
+        Ok(())
+    }
+
     /// Execute `sql` end-to-end, streaming chunks into `tx`.
     pub async fn run_sql(
         &self,
@@ -67,7 +124,10 @@ impl DriverServer {
         tx: ChunkTx,
     ) -> forge_common::Result<()> {
         let started = Instant::now();
+        let sql = normalize_dialect(&sql);
         let ctx = self.sessions.context(&session);
+        let warehouse_dir = self.sessions.settings(&session).warehouse_dir;
+        self.prepare_tables(&ctx, &sql, warehouse_dir.as_deref()).await?;
         let logical = ctx.state().create_logical_plan(&sql).await?;
 
         let job_id = forge_common::new_id();
@@ -93,6 +153,27 @@ impl DriverServer {
             return Ok(());
         }
 
+        // Managed tables: CREATE TABLE [AS] becomes a Delta table under the
+        // warehouse directory instead of a driver-local MemTable.
+        if let LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(cmt)) = &logical {
+            if let (Some(dir), false) = (warehouse_dir.as_deref(), cmt.temporary) {
+                let target = forge_sql::managed::resolve(&ctx, &cmt.name);
+                ensure_namespace(&ctx, &target.catalog, &target.schema)?;
+                send(Payload::Started(QueryStarted { job_id: job_id.clone(), explain: String::new() })).await;
+                match create_managed_table(&ctx, cmt, dir).await? {
+                    CreateOutcome::Created(spec) => {
+                        tracing::info!(table = %spec.name, location = %spec.location, "created managed table");
+                        self.tables.insert(spec.name.clone(), RegisteredTable { spec, managed: true });
+                    }
+                    CreateOutcome::AlreadyExists => {}
+                }
+                let schema: SchemaRef = Arc::new(Schema::empty());
+                let rows = stream_batches(&tx, schema, futures::stream::empty(), max_rows).await?;
+                send(Payload::Finished(QueryFinished { rows, elapsed_ms: started.elapsed().as_millis() as u64, stages: vec![] })).await;
+                return Ok(());
+            }
+        }
+
         let local_only = matches!(
             logical,
             LogicalPlan::Ddl(_)
@@ -106,10 +187,32 @@ impl DriverServer {
 
         if local_only {
             send(Payload::Started(QueryStarted { job_id: job_id.clone(), explain: String::new() })).await;
+            let touched = self.touched_table(&ctx, &logical);
+            let dropped = if let LogicalPlan::Ddl(DdlStatement::DropTable(d)) = &logical {
+                let key = full_name(&forge_sql::managed::resolve(&ctx, &d.name));
+                self.tables.remove(&key).map(|(_, t)| t)
+            } else {
+                None
+            };
             let df = ctx.execute_logical_plan(logical).await?;
             let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
             let stream = df.execute_stream().await?;
             let rows = stream_batches(&tx, schema, stream, max_rows).await?;
+            if let Some(t) = dropped {
+                if t.managed {
+                    if let Err(e) = drop_managed_table(&ctx, &t.spec.location).await {
+                        tracing::warn!(table = %t.spec.name, error = %e, "could not delete managed table files");
+                    }
+                }
+            }
+            // DML wrote a new Delta version: reload so subsequent reads see it.
+            if let Some(key) = touched {
+                if let Some(t) = self.tables.get(&key).map(|t| t.spec.clone()) {
+                    if let Err(e) = register_table(&ctx, &t).await {
+                        tracing::warn!(table = %t.name, error = %e, "could not refresh table after DML");
+                    }
+                }
+            }
             send(Payload::Finished(QueryFinished { rows, elapsed_ms: started.elapsed().as_millis() as u64, stages: vec![] })).await;
             return Ok(());
         }
@@ -180,6 +283,8 @@ impl DriverServer {
 
     async fn explain_sql(&self, session: Arc<Session>, sql: &str) -> forge_common::Result<ExplainResponse> {
         let ctx = self.sessions.context(&session);
+        let warehouse_dir = self.sessions.settings(&session).warehouse_dir;
+        self.prepare_tables(&ctx, sql, warehouse_dir.as_deref()).await?;
         let logical = ctx.state().create_logical_plan(sql).await?;
         let optimized = ctx.state().optimize(&logical)?;
         let physical = ctx.state().create_physical_plan(&logical).await?;
@@ -241,6 +346,48 @@ where
         let _ = tx.send(Ok(ResultChunk { payload: Some(Payload::Ipc(tail)) })).await;
     }
     Ok(rows)
+}
+
+/// Map Spark SQL spellings DataFusion's parser rejects onto their
+/// DataFusion equivalents (`DESCRIBE [TABLE] [EXTENDED] t` -> `DESCRIBE t`).
+fn normalize_dialect(sql: &str) -> String {
+    let trimmed = sql.trim().trim_end_matches(';');
+    let mut words = trimmed.split_whitespace();
+    let Some(first) = words.next() else { return sql.to_string() };
+    if !first.eq_ignore_ascii_case("DESCRIBE") && !first.eq_ignore_ascii_case("DESC") {
+        return sql.to_string();
+    }
+    let rest: Vec<&str> = words
+        .skip_while(|w| ["TABLE", "EXTENDED", "FORMATTED"].iter().any(|k| w.eq_ignore_ascii_case(k)))
+        .collect();
+    if rest.is_empty() {
+        return sql.to_string();
+    }
+    format!("DESCRIBE {}", rest.join(" "))
+}
+
+fn full_name(r: &datafusion::sql::ResolvedTableReference) -> String {
+    format!("{}.{}.{}", r.catalog, r.schema, r.table)
+}
+
+/// Make sure `catalog.schema` exists so tables can be registered under it.
+fn ensure_namespace(ctx: &SessionContext, catalog: &str, schema: &str) -> DFResult<()> {
+    if schema.is_empty() {
+        return Ok(());
+    }
+    let catalog_name = if catalog.is_empty() { forge_sql::session::DEFAULT_CATALOG } else { catalog };
+    let cat = match ctx.catalog(catalog_name) {
+        Some(c) => c,
+        None => {
+            let c: Arc<dyn CatalogProvider> = Arc::new(MemoryCatalogProvider::new());
+            ctx.register_catalog(catalog_name, Arc::clone(&c));
+            c
+        }
+    };
+    if cat.schema(schema).is_none() {
+        cat.register_schema(schema, Arc::new(MemorySchemaProvider::new()))?;
+    }
+    Ok(())
 }
 
 fn to_status(e: ForgeError) -> Status {
@@ -305,6 +452,7 @@ impl DriverService for DriverServer {
             config: self.config.clone(),
             scheduler: Arc::clone(&self.scheduler),
             sessions: Arc::clone(&self.sessions),
+            tables: Arc::clone(&self.tables),
             started: self.started,
         };
         tokio::spawn(async move {
@@ -340,7 +488,17 @@ impl DriverService for DriverServer {
         let spec = TableSpec { name, format, location: req.location, options: req.options };
         let session = self.sessions.session("", &HashMap::new());
         let ctx = self.sessions.context(&session);
+        ensure_namespace(&ctx, &req.catalog, &req.schema).map_err(|e| to_status(e.into()))?;
         let schema = register_table(&ctx, &spec).await.map_err(|e| to_status(e.into()))?;
+        let key = full_name(&forge_sql::managed::resolve(&ctx, &datafusion::sql::TableReference::parse_str(&spec.name)));
+        let managed = self
+            .sessions
+            .settings(&session)
+            .warehouse_dir
+            .as_deref()
+            .map(|d| spec.location.trim_end_matches('/').starts_with(d.trim_end_matches('/')))
+            .unwrap_or(false);
+        self.tables.insert(key, RegisteredTable { spec, managed });
         let fields: Vec<serde_json::Value> = schema
             .fields()
             .iter()
@@ -388,6 +546,7 @@ struct DriverHandle {
     config: DriverConfig,
     scheduler: Arc<Scheduler>,
     sessions: Arc<SessionManager>,
+    tables: Arc<dashmap::DashMap<String, RegisteredTable>>,
     started: Instant,
 }
 
@@ -397,7 +556,22 @@ impl DriverHandle {
             config: self.config,
             scheduler: self.scheduler,
             sessions: self.sessions,
+            tables: self.tables,
             started: self.started,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_dialect;
+
+    #[test]
+    fn describe_table_variants_collapse_to_describe() {
+        assert_eq!(normalize_dialect("DESCRIBE TABLE main.default.t;"), "DESCRIBE main.default.t");
+        assert_eq!(normalize_dialect("desc extended t"), "DESCRIBE t");
+        assert_eq!(normalize_dialect("DESCRIBE t"), "DESCRIBE t");
+        assert_eq!(normalize_dialect("SELECT 1"), "SELECT 1");
+        assert_eq!(normalize_dialect("DESCRIBE"), "DESCRIBE");
     }
 }

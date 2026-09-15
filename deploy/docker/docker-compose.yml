@@ -1,0 +1,46 @@
+# Single-host Lakeforge: control plane + Postgres, Forge clusters run as local
+# processes inside the api container.
+#
+#   docker compose -f deploy/docker/docker-compose.yml up -d
+#   open http://localhost:8080   (admin@lakeforge.local / admin)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lakeforge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakeforge}
+      POSTGRES_DB: lakeforge
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakeforge"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    image: ${LAKEFORGE_API_IMAGE:-ghcr.io/andyh-viv/lakeforge-api}:${LAKEFORGE_IMAGE_TAG:-latest}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${LAKEFORGE_PORT:-8080}:8080"
+    environment:
+      LAKEFORGE_DATABASE_URL: postgres://lakeforge:${POSTGRES_PASSWORD:-lakeforge}@postgres:5432/lakeforge
+      LAKEFORGE_PUBLIC_URL: ${LAKEFORGE_PUBLIC_URL:-http://localhost:8080}
+      LAKEFORGE_ADMIN_USER: ${LAKEFORGE_ADMIN_USER:-admin@lakeforge.local}
+      LAKEFORGE_ADMIN_PASSWORD: ${LAKEFORGE_ADMIN_PASSWORD:-admin}
+      LAKEFORGE_JWT_SECRET: ${LAKEFORGE_JWT_SECRET:-change-me-in-production}
+      LAKEFORGE_CLUSTER_BACKEND: local
+      LAKEFORGE_CLOUD: local
+    volumes:
+      - lakeforge-data:/var/lib/lakeforge/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  lakeforge-data:

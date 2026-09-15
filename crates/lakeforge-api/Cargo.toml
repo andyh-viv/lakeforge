@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 clap = { workspace = true }
 jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
@@ -30,6 +31,26 @@ futures = { workspace = true }
 arrow = { workspace = true }
 arrow-ipc = { workspace = true }
 cron = { workspace = true }
+chrono-tz = { workspace = true }
+object_store = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+url = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true }
+async-stream = { workspace = true }
+mime_guess = { workspace = true }
+regex = { workspace = true }
 forge-proto = { workspace = true }
 forge-common = { workspace = true }
+forge-client = { workspace = true }
 lakeforge-cluster-manager = { workspace = true }
+
+[[bin]]
+name = "lakeforge-api"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = { workspace = true }

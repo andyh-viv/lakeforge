@@ -8,6 +8,7 @@ use datafusion::prelude::{CsvReadOptions, JsonReadOptions, ParquetReadOptions, S
 use datafusion::sql::TableReference;
 use serde::{Deserialize, Serialize};
 
+use crate::delta_provider::ManagedDeltaTable;
 use crate::object_store::{ensure_object_store, parse_location};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,6 +73,7 @@ pub async fn register_table(
                 .build()
                 .await
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            let provider = ManagedDeltaTable::new(Arc::new(provider), url.clone(), spec.options.clone());
             ctx.register_table(table_ref.clone(), Arc::new(provider))?;
         }
         TableFormat::Parquet => {

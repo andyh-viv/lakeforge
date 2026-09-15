@@ -36,7 +36,7 @@ impl ExecutorEntry {
     pub fn info(&self) -> ExecutorInfo {
         ExecutorInfo {
             metadata: Some(self.metadata.clone()),
-            resources: Some(self.resources.clone()),
+            resources: Some(self.resources),
             last_heartbeat_ms: self.last_heartbeat_ms,
             running_tasks: self.running.len() as u32,
             completed_tasks: self.completed_tasks,

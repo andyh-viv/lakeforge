@@ -1,0 +1,22 @@
+Lakeforge {{ .Chart.AppVersion }} deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Forge clusters will be launched into namespace "{{ .Values.forge.namespace }}"
+using image {{ include "lakeforge.forgeImage" . }}.
+
+{{- if .Values.ingress.enabled }}
+Workspace URL: http{{ if .Values.ingress.tls }}s{{ end }}://{{ .Values.ingress.host }}
+{{- else if eq .Values.service.type "LoadBalancer" }}
+Workspace URL: run
+  kubectl -n {{ .Release.Namespace }} get svc {{ include "lakeforge.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}'
+{{- else }}
+Port-forward the workspace:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "lakeforge.fullname" . }} 8080:{{ .Values.service.port }}
+  open http://localhost:8080
+{{- end }}
+
+Admin login: {{ .Values.controlPlane.adminUser }}
+Password:    kubectl -n {{ .Release.Namespace }} get secret {{ include "lakeforge.secretName" . }} -o jsonpath='{.data.admin-password}' | base64 -d
+
+CLI / SDK:
+  pip install ./python/lakeforge-sdk
+  lakeforge auth login --host <workspace-url> -u {{ .Values.controlPlane.adminUser }} --pat
