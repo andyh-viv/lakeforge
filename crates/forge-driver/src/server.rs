@@ -124,6 +124,7 @@ impl DriverServer {
         tx: ChunkTx,
     ) -> forge_common::Result<()> {
         let started = Instant::now();
+        let sql = normalize_dialect(&sql);
         let ctx = self.sessions.context(&session);
         let warehouse_dir = self.sessions.settings(&session).warehouse_dir;
         self.prepare_tables(&ctx, &sql, warehouse_dir.as_deref()).await?;
@@ -347,6 +348,24 @@ where
     Ok(rows)
 }
 
+/// Map Spark SQL spellings DataFusion's parser rejects onto their
+/// DataFusion equivalents (`DESCRIBE [TABLE] [EXTENDED] t` -> `DESCRIBE t`).
+fn normalize_dialect(sql: &str) -> String {
+    let trimmed = sql.trim().trim_end_matches(';');
+    let mut words = trimmed.split_whitespace();
+    let Some(first) = words.next() else { return sql.to_string() };
+    if !first.eq_ignore_ascii_case("DESCRIBE") && !first.eq_ignore_ascii_case("DESC") {
+        return sql.to_string();
+    }
+    let rest: Vec<&str> = words
+        .skip_while(|w| ["TABLE", "EXTENDED", "FORMATTED"].iter().any(|k| w.eq_ignore_ascii_case(k)))
+        .collect();
+    if rest.is_empty() {
+        return sql.to_string();
+    }
+    format!("DESCRIBE {}", rest.join(" "))
+}
+
 fn full_name(r: &datafusion::sql::ResolvedTableReference) -> String {
     format!("{}.{}.{}", r.catalog, r.schema, r.table)
 }
@@ -540,5 +559,19 @@ impl DriverHandle {
             tables: self.tables,
             started: self.started,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_dialect;
+
+    #[test]
+    fn describe_table_variants_collapse_to_describe() {
+        assert_eq!(normalize_dialect("DESCRIBE TABLE main.default.t;"), "DESCRIBE main.default.t");
+        assert_eq!(normalize_dialect("desc extended t"), "DESCRIBE t");
+        assert_eq!(normalize_dialect("DESCRIBE t"), "DESCRIBE t");
+        assert_eq!(normalize_dialect("SELECT 1"), "SELECT 1");
+        assert_eq!(normalize_dialect("DESCRIBE"), "DESCRIBE");
     }
 }

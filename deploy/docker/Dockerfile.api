@@ -33,6 +33,7 @@ COPY --from=build /out/lakeforge-api /out/forge /usr/local/bin/
 COPY --from=web /web/dist /opt/lakeforge/ui
 COPY python/lakeforge-sdk /opt/lakeforge/sdk
 RUN pip3 install --break-system-packages --no-cache-dir /opt/lakeforge/sdk pandas \
+    && mkdir -p /var/lib/lakeforge/data \
     && chown -R lakeforge:lakeforge /opt/lakeforge /var/lib/lakeforge
 
 USER lakeforge

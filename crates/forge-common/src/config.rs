@@ -72,6 +72,9 @@ impl SessionSettings {
     /// (e.g. `FORGE_CONF_FORGE_SQL_SHUFFLE_PARTITIONS=32`).
     pub fn from_env() -> Self {
         let mut s = Self::default();
+        if let Some(mb) = std::env::var("FORGE_MEMORY_LIMIT_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+            s.memory_limit_bytes = Some(mb * 1024 * 1024);
+        }
         for (k, v) in std::env::vars() {
             if let Some(rest) = k.strip_prefix("FORGE_CONF_") {
                 let key = rest.to_ascii_lowercase().replace('_', ".");

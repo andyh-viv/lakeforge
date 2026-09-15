@@ -127,9 +127,9 @@ function Details({ type, item }: { type: 'catalog' | 'schema' | 'table' | 'volum
             ['Comment', item.comment || '—'],
             ['Created', fmtTime(item.created_at)],
             ['Updated', fmtTime(item.updated_at)],
-            ...(type === 'table' ? ([['Table type', item.table_type ?? ''], ['Format', item.data_source_format ?? ''], ['Location', <code className="small">{item.storage_location ?? ''}</code>]] as [string, ReactNode][]) : []),
-            ...(type === 'volume' ? ([['Volume type', String(item.volume_type ?? '')], ['Location', <code className="small">{String(item.storage_location ?? '')}</code>]] as [string, ReactNode][]) : []),
-            ...(type === 'function' ? ([['Language', String(item.routine_definition_language ?? item.external_language ?? 'SQL')], ['Definition', <pre className="small">{String(item.routine_definition ?? '')}</pre>]] as [string, ReactNode][]) : []),
+            ...(type === 'table' ? ([['Table type', item.table_type ?? ''], ['Format', item.data_source_format ?? ''], ['Location', <code key="location" className="small">{item.storage_location ?? ''}</code>]] as [string, ReactNode][]) : []),
+            ...(type === 'volume' ? ([['Volume type', String(item.volume_type ?? '')], ['Location', <code key="location" className="small">{String(item.storage_location ?? '')}</code>]] as [string, ReactNode][]) : []),
+            ...(type === 'function' ? ([['Language', String(item.routine_definition_language ?? item.external_language ?? 'SQL')], ['Definition', <pre key="definition" className="small">{String(item.routine_definition ?? '')}</pre>]] as [string, ReactNode][]) : []),
             ['Properties', Object.entries(item.properties ?? {}).map(([k, v]) => `${k}=${v}`).join(', ') || '—'],
           ]}
         />

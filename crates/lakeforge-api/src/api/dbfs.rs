@@ -79,7 +79,7 @@ async fn list(State(st): State<S>, Query(q): Query<PathQ>) -> ApiResult<Json<Val
     if let Some(meta) = st.storage.head(&sp).await? {
         return Ok(Json(json!({ "files": [ { "path": user, "is_dir": false, "file_size": meta.size, "modification_time": meta.last_modified.timestamp_millis() } ] })));
     }
-    if !st.storage.is_dir(&sp).await? {
+    if user != "/" && !st.storage.is_dir(&sp).await? {
         return Err(ApiError::NotFound(format!("No file or directory exists on path {}.", q.path)));
     }
     let entries = st.storage.list_dir(&sp).await?;
