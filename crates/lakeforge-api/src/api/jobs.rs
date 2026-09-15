@@ -944,7 +944,10 @@ fn summarize_outputs(outputs: &[crate::kernel::KernelEvent]) -> (String, Option<
     (logs, err, trace)
 }
 
-fn validate_settings(s: &Map<String, Value>) -> ApiResult<()> {
+/// Validate job settings. Top-level `null` fields (e.g. `"schedule": null` from
+/// clients that mean "unset") are stripped first so they read as absent.
+fn validate_settings(s: &mut Map<String, Value>) -> ApiResult<()> {
+    s.retain(|_, v| !v.is_null());
     let tasks = s.get("tasks").and_then(|v| v.as_array()).ok_or_else(|| ApiError::invalid("tasks is required"))?;
     let mut keys = HashSet::new();
     for t in tasks {
@@ -973,7 +976,7 @@ fn validate_settings(s: &Map<String, Value>) -> ApiResult<()> {
 
 async fn create(State(st): State<S>, Who(p): Who, Body(mut settings): Body<Map<String, Value>>) -> ApiResult<Json<Value>> {
     let access = settings.remove("access_control_list");
-    validate_settings(&settings)?;
+    validate_settings(&mut settings)?;
     settings.entry("name").or_insert(json!("Untitled"));
     settings.entry("format").or_insert(json!("MULTI_TASK"));
     settings.entry("max_concurrent_runs").or_insert(json!(1));
@@ -1048,8 +1051,8 @@ struct ResetBody {
     new_settings: Map<String, Value>,
 }
 
-async fn reset(State(st): State<S>, Body(b): Body<ResetBody>) -> ApiResult<Json<Value>> {
-    validate_settings(&b.new_settings)?;
+async fn reset(State(st): State<S>, Body(mut b): Body<ResetBody>) -> ApiResult<Json<Value>> {
+    validate_settings(&mut b.new_settings)?;
     let mut job = st.get_job(b.job_id).await?.data;
     job.settings = b.new_settings;
     job.next_run_ms = None;
@@ -1096,7 +1099,7 @@ async fn update(State(st): State<S>, Body(b): Body<UpdateBody>) -> ApiResult<Jso
             job.settings.remove(&f);
         }
     }
-    validate_settings(&job.settings)?;
+    validate_settings(&mut job.settings)?;
     job.next_run_ms = None;
     st.save_job(&job).await?;
     Ok(empty())
@@ -1175,7 +1178,7 @@ async fn submit(State(st): State<S>, Who(p): Who, Body(mut b): Body<Map<String, 
         }
         b.insert("tasks".into(), json!([task]));
     }
-    validate_settings(&b)?;
+    validate_settings(&mut b)?;
     b.entry("run_name").or_insert(json!(format!("Untitled run {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S"))));
     let timeout = b.get("timeout_seconds").and_then(|v| v.as_u64()).unwrap_or(0);
     let run = st.create_run(&p, None, &b, "ONE_TIME", "SUBMIT_RUN", Map::new(), Map::new(), None).await?;
