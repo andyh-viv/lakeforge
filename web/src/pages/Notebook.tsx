@@ -45,6 +45,7 @@ export function Output({ ev }: { ev: KernelEvent }) {
       return <ResultGrid columns={ev.columns} rows={ev.rows} truncated={ev.truncated} />
     case 'display':
       if (ev.mime === 'text/html') return <div className="html" dangerouslySetInnerHTML={{ __html: String(ev.data) }} />
+      if (ev.mime === 'text/markdown') return <div className="md-cell" dangerouslySetInnerHTML={{ __html: renderMarkdown(String(ev.data)) }} />
       if (ev.mime.startsWith('image/')) return <img alt="output" src={`data:${ev.mime};base64,${String(ev.data)}`} />
       if (ev.mime === 'application/json') return <pre className="json">{JSON.stringify(ev.data, null, 2)}</pre>
       return <pre>{typeof ev.data === 'string' ? ev.data : JSON.stringify(ev.data)}</pre>
