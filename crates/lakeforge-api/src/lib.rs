@@ -14,8 +14,12 @@ pub mod workers;
 
 use std::sync::Arc;
 
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Router;
+use tower::ServiceExt;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 
 pub use config::Config;
@@ -26,11 +30,30 @@ pub fn router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
     let mut app = api::router(Arc::clone(&state));
     if let Some(ui) = &state.config.ui_dir {
-        let index = std::path::Path::new(ui).join("index.html");
-        let serve = tower_http::services::ServeDir::new(ui).not_found_service(tower_http::services::ServeFile::new(index));
-        app = app.fallback_service(serve);
+        let ui = ui.clone();
+        app = app.fallback(move |req: axum::extract::Request| serve_spa(ui.clone(), req));
     }
     app.layer(cors).layer(TraceLayer::new_for_http())
+}
+
+/// Serve static assets from the UI bundle; any unknown non-API path gets
+/// `index.html` with 200 so client-side routes deep-link correctly.
+async fn serve_spa(ui: String, req: axum::extract::Request) -> Response {
+    let path = req.uri().path().to_string();
+    if path.starts_with("/api/") || path.starts_with("/ajax-api/") {
+        return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({ "error_code": "ENDPOINT_NOT_FOUND", "message": format!("No API found for '{} {}'", req.method(), path) }))).into_response();
+    }
+    let index = std::path::Path::new(&ui).join("index.html");
+    match ServeDir::new(&ui).oneshot(req).await {
+        Ok(res) if res.status() != StatusCode::NOT_FOUND => res.into_response(),
+        _ => {
+            let idx = axum::extract::Request::builder().uri("/").body(axum::body::Body::empty()).expect("static request");
+            match ServeFile::new(index).oneshot(idx).await {
+                Ok(res) => res.into_response(),
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+    }
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
