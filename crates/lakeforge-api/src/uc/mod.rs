@@ -2,6 +2,7 @@
 //! rewriting, lineage, audit log, system tables and UC models.
 
 pub mod audit;
+pub mod grant_sql;
 pub mod lineage;
 pub mod models;
 pub mod privileges;

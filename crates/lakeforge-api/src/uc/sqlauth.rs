@@ -12,13 +12,15 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use sqlparser::ast::Statement;
 
-use crate::api::catalog::{KIND_FUNCTION, KIND_SCHEMA, KIND_TABLE, SYSTEM_CATALOG};
+use crate::api::catalog::{GrantChange, KIND_FUNCTION, KIND_SCHEMA, KIND_TABLE, SYSTEM_CATALOG};
 use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
+use crate::forge::ColumnInfo;
 use crate::state::AppState;
 use crate::store::{Doc, Filter};
+use crate::uc::grant_sql::{self, GrantStmt};
 use crate::uc::privileges::{Authorizer, Securable};
-use crate::uc::sqlguard::{self, Analysis, SessionFacts, SqlFunction, TablePolicy};
+use crate::uc::sqlguard::{self, Analysis, SessionFacts, SqlFunction, StmtKind, TablePolicy};
 use crate::uc::system_tables;
 
 pub const CONF_DEFAULT_CATALOG: &str = "forge.sql.defaultCatalog";
@@ -44,6 +46,14 @@ pub struct PreparedSql {
 pub enum MetastoreOp {
     CreateFunction { doc: serde_json::Map<String, Value>, replace: bool },
     DropFunction { names: Vec<String>, if_exists: bool },
+    Grant(GrantStmt),
+}
+
+/// Tabular output of a metastore-only statement (empty for DDL).
+#[derive(Debug, Default)]
+pub struct MetastoreOutput {
+    pub columns: Vec<ColumnInfo>,
+    pub rows: Vec<Vec<Option<String>>>,
 }
 
 pub fn defaults(conf: &HashMap<String, String>) -> (String, String) {
@@ -83,6 +93,14 @@ fn metastore_op(stmts: &[Statement], cat: &str, sch: &str) -> Option<MetastoreOp
     }
 }
 
+fn grant_kind(s: &GrantStmt) -> StmtKind {
+    match s {
+        GrantStmt::ShowGrants { .. } => StmtKind::Show,
+        GrantStmt::SetOwner { .. } => StmtKind::Alter,
+        _ => StmtKind::Other,
+    }
+}
+
 fn parent_schema(full: &str) -> Option<String> {
     let parts: Vec<&str> = full.split('.').collect();
     (parts.len() == 3).then(|| format!("{}.{}", parts[0], parts[1]))
@@ -96,6 +114,11 @@ impl AppState {
     /// Analyse, authorise and rewrite `sql` for `p`.
     pub async fn prepare_sql(self: &Arc<Self>, p: &Principal, sql: &str, conf: &HashMap<String, String>) -> ApiResult<PreparedSql> {
         let (cat, sch) = defaults(conf);
+        if let Some(parsed) = grant_sql::parse(sql, &cat, &sch) {
+            let stmt = parsed.map_err(|e| ApiError::invalid(format!("[PARSE_SYNTAX_ERROR] {e}")))?;
+            let analysis = Analysis { kind: grant_kind(&stmt), parsed: true, ..Default::default() };
+            return Ok(PreparedSql { sql: sql.to_string(), analysis, default_catalog: cat, default_schema: sch, table_types: HashMap::new(), metastore_op: Some(MetastoreOp::Grant(stmt)) });
+        }
         let (stmts, analysis) = sqlguard::analyze(sql, &cat, &sch);
         let table_types = self.authorize_sql(p, &analysis).await?;
         let metastore_op = stmts.as_deref().and_then(|s| metastore_op(s, &cat, &sch));
@@ -106,12 +129,53 @@ impl AppState {
         Ok(PreparedSql { sql: rewritten.unwrap_or_else(|| sql.to_string()), analysis, default_catalog: cat, default_schema: sch, table_types, metastore_op })
     }
 
-    /// Apply a metastore-only statement (SQL UDF create/drop) after it has
-    /// been authorised by `authorize_sql`.
-    pub async fn apply_metastore_op(&self, p: &Principal, op: &MetastoreOp) -> ApiResult<()> {
+    /// Apply a metastore-only statement. UDF DDL was authorised by
+    /// `authorize_sql`; privilege statements authorise themselves (owner /
+    /// admin checks live in the grant and patch paths).
+    pub async fn apply_metastore_op(&self, p: &Principal, op: &MetastoreOp) -> ApiResult<MetastoreOutput> {
         match op {
+            MetastoreOp::Grant(GrantStmt::Grant { privileges, securable, name, principal }) => {
+                self.uc_update_grants(p, *securable, name, vec![GrantChange { principal: principal.clone(), add: privileges.clone(), remove: vec![] }]).await?;
+            }
+            MetastoreOp::Grant(GrantStmt::Revoke { privileges, securable, name, principal }) => {
+                self.uc_update_grants(p, *securable, name, vec![GrantChange { principal: principal.clone(), add: vec![], remove: privileges.clone() }]).await?;
+            }
+            MetastoreOp::Grant(GrantStmt::SetOwner { securable, name, owner }) => {
+                let kind = securable.kind().ok_or_else(|| ApiError::invalid("Cannot change the owner of the metastore"))?;
+                let mut o = serde_json::Map::new();
+                o.insert("owner".into(), json!(owner));
+                self.uc_patch(p, *securable, kind, name, &o, &["owner"], securable.api_type()).await?;
+            }
+            MetastoreOp::Grant(GrantStmt::ShowGrants { principal, securable, name }) => {
+                if !self.uc_exists(*securable, name).await? {
+                    return Err(ApiError::NotFound(format!("{} '{name}' does not exist.", securable.api_type())));
+                }
+                let mut az = Authorizer::new(self, p);
+                if *securable != Securable::Metastore && !az.can_browse(*securable, name).await? {
+                    return Err(ApiError::PermissionDenied(format!("[INSUFFICIENT_PERMISSIONS] User {} cannot view grants on {} '{name}'.", p.user_name, securable.api_type())));
+                }
+                let eff = az.effective(*securable, name, principal.as_deref()).await?;
+                let columns = ["Principal", "ActionType", "ObjectType", "ObjectKey"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| ColumnInfo { name: n.to_string(), type_text: "string".into(), type_name: "STRING".into(), position: i })
+                    .collect();
+                let mut rows = vec![];
+                for a in eff["privilege_assignments"].as_array().into_iter().flatten() {
+                    let who = a["principal"].as_str().unwrap_or_default();
+                    for pv in a["privileges"].as_array().into_iter().flatten() {
+                        let (ty, key) = match (pv["inherited_from_type"].as_str(), pv["inherited_from_name"].as_str()) {
+                            (Some(t), Some(n)) => (t.to_string(), n.to_string()),
+                            _ => (securable.api_type().to_string(), name.clone()),
+                        };
+                        rows.push(vec![Some(who.to_string()), pv["privilege"].as_str().map(str::to_string), Some(ty), Some(key)]);
+                    }
+                }
+                return Ok(MetastoreOutput { columns, rows });
+            }
             MetastoreOp::CreateFunction { doc, replace } => {
-                let full = doc.get("full_name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let part = |k: &str| doc.get(k).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                let full = format!("{}.{}.{}", part("catalog_name"), part("schema_name"), part("name"));
                 if *replace && self.uc_get(KIND_FUNCTION, &full).await?.is_some() {
                     self.uc_delete_in_schema(p, KIND_FUNCTION, Securable::Function, &full, "Function").await?;
                 }
@@ -126,7 +190,7 @@ impl AppState {
                 }
             }
         }
-        Ok(())
+        Ok(MetastoreOutput::default())
     }
 
     /// Enforce UC privileges for a statement. Objects unknown to the

@@ -197,7 +197,7 @@ impl AppState {
             self.refresh_system_tables_for(sys_refs).await;
         }
         let res = match &prepared.metastore_op {
-            Some(op) => self.apply_metastore_op(user, op).await.map(|()| SqlResult { job_id: hist_id.clone(), elapsed_ms: (now_ms() - started) as u64, ..SqlResult::default() }),
+            Some(op) => self.apply_metastore_op(user, op).await.map(|out| SqlResult { job_id: hist_id.clone(), row_count: out.rows.len(), columns: out.columns, rows: out.rows, elapsed_ms: (now_ms() - started) as u64, ..SqlResult::default() }),
             None => {
                 let addr = self.cluster_driver(cluster_id, true).await?;
                 let session_id = format!("user:{}", user.user_id);
