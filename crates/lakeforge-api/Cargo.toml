@@ -43,6 +43,8 @@ tokio-stream = { workspace = true }
 async-stream = { workspace = true }
 mime_guess = { workspace = true }
 regex = { workspace = true }
+sqlparser = { workspace = true }
+parquet = { workspace = true }
 forge-proto = { workspace = true }
 forge-common = { workspace = true }
 forge-client = { workspace = true }

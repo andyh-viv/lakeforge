@@ -263,6 +263,7 @@ impl AppState {
                 if let Err(e) = st.sync_metastore_to_cluster(&c).await {
                     tracing::warn!(cluster = %id, error = %e, "metastore sync failed");
                 }
+                st.refresh_all_system_tables().await;
             } else {
                 c.state = ClusterState::Error;
                 c.state_message = "Driver did not become reachable".into();

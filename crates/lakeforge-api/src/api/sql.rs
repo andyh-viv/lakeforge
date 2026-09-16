@@ -23,6 +23,8 @@ use crate::error::{ApiError, ApiResult};
 use crate::forge::{run_sql, SqlResult};
 use crate::state::AppState;
 use crate::store::{now_ms, Doc, Filter};
+use crate::uc::lineage::LineageContext;
+use crate::uc::system_tables;
 
 pub const KIND_WAREHOUSE: &str = "warehouse";
 pub const KIND_QUERY: &str = "sql_query";
@@ -181,11 +183,28 @@ impl AppState {
         max_rows: usize,
     ) -> ApiResult<SqlResult> {
         let started = now_ms();
-        let addr = self.cluster_driver(cluster_id, true).await?;
-        let session_id = format!("user:{}", user.user_id);
-        let res = run_sql(&self.forge, &addr, &session_id, sql, conf, max_rows).await;
-        let finished = now_ms();
         let hist_id = uuid::Uuid::new_v4().to_string();
+        let lineage_ctx = LineageContext::from_conf(&conf);
+        let prepared = match self.prepare_sql(user, sql, &conf).await {
+            Ok(p) => p,
+            Err(e) => {
+                self.audit(user, "unityCatalog", "sqlStatementDenied", json!({ "statement_id": hist_id, "cluster_id": cluster_id, "warehouse_id": warehouse_id, "sql": sql }), 403, Some(e.to_string())).await;
+                return Err(e);
+            }
+        };
+        let sys_refs = system_tables::system_refs(prepared.analysis.reads.iter());
+        if !sys_refs.is_empty() {
+            self.refresh_system_tables_for(sys_refs).await;
+        }
+        let res = match &prepared.metastore_op {
+            Some(op) => self.apply_metastore_op(user, op).await.map(|()| SqlResult { job_id: hist_id.clone(), elapsed_ms: (now_ms() - started) as u64, ..SqlResult::default() }),
+            None => {
+                let addr = self.cluster_driver(cluster_id, true).await?;
+                let session_id = format!("user:{}", user.user_id);
+                run_sql(&self.forge, &addr, &session_id, &prepared.sql, conf, max_rows).await
+            }
+        };
+        let finished = now_ms();
         let (status, rows, err) = match &res {
             Ok(r) => ("FINISHED", r.row_count as i64, None),
             Err(e) => ("FAILED", 0, Some(e.to_string())),
@@ -212,9 +231,23 @@ impl AppState {
             "metrics": res.as_ref().ok().map(|r| json!({ "total_time_ms": r.elapsed_ms, "rows_produced_count": r.row_count, "execution_time_ms": r.elapsed_ms, "compilation_time_ms": 0 })),
         });
         let _ = self.store.insert(KIND_HISTORY, self.ws(), &hist_id, warehouse_id, None, &hist).await;
-        if res.is_ok() && matches!(stmt_type.as_str(), "CREATE" | "DROP") {
-            self.observe_ddl(sql, &user.user_name).await;
+        let an = &prepared.analysis;
+        if res.is_ok() {
+            self.observe_ddl(an, sql, &user.user_name).await;
+            if let Err(e) = self.record_lineage(user, &hist_id, an, &lineage_ctx, &prepared.table_types).await {
+                tracing::warn!(error = %e, "lineage capture failed");
+            }
         }
+        let http_status = if res.is_ok() { 200 } else { 400 };
+        self.audit(
+            user,
+            "sql",
+            "executeStatement",
+            json!({ "statement_id": hist_id, "cluster_id": cluster_id, "warehouse_id": warehouse_id, "statement_type": an.kind.as_str(), "reads": an.reads, "writes": an.writes, "rows_produced": rows }),
+            http_status,
+            err.clone(),
+        )
+        .await;
         res
     }
 
