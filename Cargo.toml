@@ -33,6 +33,7 @@ datafusion-proto = "53"
 deltalake = { version = "0.32", features = ["datafusion", "s3", "gcs", "azure"] }
 object_store = { version = "0.13", features = ["aws", "gcp", "azure", "http"] }
 parquet = "58"
+sqlparser = { version = "0.61", features = ["visitor"] }
 
 # Async / network
 tokio = { version = "1", features = ["full"] }

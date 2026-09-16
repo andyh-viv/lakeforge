@@ -10,6 +10,7 @@ pub mod kernel;
 pub mod state;
 pub mod storage;
 pub mod store;
+pub mod uc;
 pub mod workers;
 
 use std::sync::Arc;

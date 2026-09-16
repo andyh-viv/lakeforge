@@ -2,10 +2,12 @@
 //! `router()` mounted here.
 
 pub mod catalog;
+pub mod catalog_ext;
 pub mod clusters;
 pub mod commands;
 pub mod dbfs;
 pub mod jobs;
+pub mod lakebase;
 pub mod misc;
 pub mod mlflow;
 pub mod notebooks;
@@ -33,6 +35,7 @@ use serde_json::json;
 use crate::auth::auth_middleware;
 use crate::error::ApiError;
 use crate::state::AppState;
+use crate::uc::audit::audit_middleware;
 
 pub type S = Arc<AppState>;
 
@@ -79,6 +82,8 @@ pub fn router(state: S) -> Router {
         .merge(notebooks::router())
         .merge(sql::router())
         .merge(catalog::router())
+        .merge(catalog_ext::router())
+        .merge(lakebase::router())
         .merge(secrets::router())
         .merge(tokens::router())
         .merge(dbfs::router())
@@ -90,6 +95,7 @@ pub fn router(state: S) -> Router {
         .merge(permissions::router())
         .merge(commands::router())
         .merge(misc::router())
+        .layer(middleware::from_fn_with_state(Arc::clone(&state), audit_middleware))
         .layer(middleware::from_fn_with_state(Arc::clone(&state), auth_middleware))
         .layer(middleware::from_fn(default_json_content_type))
         .with_state(Arc::clone(&state));

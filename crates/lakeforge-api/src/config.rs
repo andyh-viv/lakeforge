@@ -50,6 +50,12 @@ pub struct Config {
     /// Interval for the job scheduler / cluster monitor loops.
     #[arg(long, env = "LAKEFORGE_TICK_SECS", default_value_t = 5)]
     pub tick_secs: u64,
+
+    /// PostgreSQL server backing Lakebase database instances
+    /// (`postgres://user:pw@host:5432/`). When unset, Lakebase instances are
+    /// metadata-only emulations with no reachable Postgres endpoint.
+    #[arg(long, env = "LAKEFORGE_LAKEBASE_POSTGRES_URL")]
+    pub lakebase_postgres_url: Option<String>,
 }
 
 impl Config {
