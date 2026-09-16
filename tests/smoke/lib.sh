@@ -11,5 +11,5 @@ A="Authorization: Bearer $(cat $TOK)"
 api() { # api METHOD PATH [JSON]
   if [ $# -ge 3 ]; then curl -s -X "$1" "$H$2" -H "$A" -H 'content-type: application/json' -d "$3"; else curl -s -X "$1" "$H$2" -H "$A"; fi; echo; }
 WH=$(api GET /api/2.0/sql/warehouses | python3 -c "import sys,json;d=json.load(sys.stdin)['warehouses'];print(d[0]['id'] if d else '')")
-CID=$(api GET /api/2.0/clusters/list | python3 -c "import sys,json;d=json.load(sys.stdin).get('clusters',[]);print(d[0]['cluster_id'] if d else '')")
+CID=$(api GET /api/2.0/clusters/list | python3 -c "import sys,json;d=[c for c in json.load(sys.stdin).get('clusters',[]) if c.get('state') in ('PENDING','RUNNING')];print(d[0]['cluster_id'] if d else '')")
 sql() { api POST /api/2.0/sql/statements "{\"warehouse_id\":\"$WH\",\"statement\":$(python3 -c 'import json,sys;print(json.dumps(sys.argv[1]))' "$1"),\"wait_timeout\":\"30s\"}"; }

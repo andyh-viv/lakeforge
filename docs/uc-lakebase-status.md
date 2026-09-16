@@ -89,6 +89,7 @@ Every statement from the Statement Execution API, notebooks (`spark.sql`,
 | Policies apply to everyone including owners and admins (Databricks semantics); exemptions are expressed inside the policy function (e.g. `is_account_group_member('admins')`) | Implemented | smoke: `masked select (admin sees clear)` relies on that branch in the mask UDF |
 | `ALTER TABLE … SET ROW FILTER / ALTER COLUMN … SET MASK` SQL syntax | Unimplemented | REST routes only |
 | Policies on views, `INSERT … SELECT` through masked columns, `MERGE` | Partial / Unimplemented | masks apply to any read; `MERGE` is not supported by Forge at all |
+| Policies on statements `sqlparser` cannot parse | **Gap** | `sqlguard::analyze_fallback` still checks table privileges on extracted names but performs no rewrite, so filters/masks are skipped (`Analysis.parsed == false`); LF-003 proposes failing closed for policy-protected tables |
 
 ## 5. Audit, query history, lineage
 

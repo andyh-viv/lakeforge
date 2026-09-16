@@ -68,6 +68,7 @@ impl AppState {
             config,
         });
         state.bootstrap_auth().await?;
+        state.ensure_default_catalog().await?;
         Ok(state)
     }
 

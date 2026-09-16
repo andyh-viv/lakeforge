@@ -2,6 +2,7 @@
 # End-to-end smoke test of the Lakeforge control plane REST API.
 set -u
 H=${LF_URL:-http://localhost:8080}
+DB=${LF_DB:-.lakeforge/lakeforge.db}   # SQLite file of the API under test (skip check if absent)
 PASS=0; FAIL=0
 step() { printf '\n== %s\n' "$*"; }
 check() { # name, condition
@@ -46,7 +47,7 @@ curl -s -X POST $H/api/2.0/secrets/scopes/create -H "$A" -d '{"scope":"smoke"}' 
 curl -s -X POST $H/api/2.0/secrets/put -H "$A" -d '{"scope":"smoke","key":"k","string_value":"s3cret"}' >/dev/null
 SV=$(curl -s "$H/api/2.0/secrets/get?scope=smoke&key=k" -H "$A" | j "['value']" | base64 -d)
 check "secret roundtrip (encrypted at rest)" '[ "$SV" = s3cret ]'
-check "secret not stored in clear" '! grep -q s3cret .lakeforge/lakeforge.db'
+if [ -f "$DB" ]; then check "secret not stored in clear" '! grep -q s3cret "$DB"'; else echo "  skip secret not stored in clear (no $DB)"; fi
 
 step "cluster"
 CID=$(curl -s -X POST $H/api/2.0/clusters/create -H "$A" -H 'content-type: application/json' -d '{"cluster_name":"smoke","spark_version":"forge","num_workers":1,"autotermination_minutes":30}' | j "['cluster_id']")

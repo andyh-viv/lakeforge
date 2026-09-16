@@ -127,7 +127,7 @@ curl -s -X POST localhost:8080/api/2.0/sql/statements -H "Authorization: Bearer 
 | Rust unit tests | `cargo test --workspace` | all green (`lakeforge-api` has 31 incl. SQL guard + grant parser) |
 | Lint | `cargo clippy --workspace --all-targets -- -D warnings` | clean (a `proc-macro-error2` future-incompat *note* from a dependency is expected) |
 | Python | `python -m pytest -q python/lakeforge-sdk/tests` and `python -m compileall -q python/lakeforge-sdk/lakeforge` | 9 passed |
-| Web | `cd web && npm run lint && npm run build` | build OK; lint has 2 pre-existing warnings (`Workspace.tsx` only-export-components, `Dashboards.tsx` set-state-in-effect) |
+| Web | `cd web && npm run lint && npm run build` | build OK; `oxlint` reports pre-existing warnings only (only-export-components, set-state-in-effect, jsx-key, `Date.now` purity) and no errors |
 | Helm / Terraform | `helm lint deploy/helm/lakeforge`; `terraform init -backend=false && terraform validate` in each root | clean |
 | Platform smoke | `bash tests/smoke/platform-smoke.sh` (API running, fresh state) | `passed=N failed=0` |
 | UC + Lakebase smoke | `bash tests/smoke/uc-lakebase-smoke.sh` (API running) | `passed=50 failed=0` |

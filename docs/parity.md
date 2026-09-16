@@ -68,11 +68,31 @@ assumed missing.
 | --- | --- | --- |
 | Metastore / metastore summary / assignment | Full | one metastore per deployment |
 | Catalogs, schemas, tables, table summaries, volumes, functions | Full | managed Delta tables materialised by Forge under the warehouse root; external tables by location |
-| External locations, storage credentials, connections | API only | persisted, not used for access control (cloud IAM does that) |
-| Grants / effective permissions | API only | grant/revoke persisted and returned by `permissions`/`effective-permissions`; **not enforced** on API calls or inside Forge SQL |
-| Lineage, system tables, audit log | Missing | |
-| Delta Sharing | Missing | |
-| Lakehouse Federation | Missing | connections stored only |
+| External locations, storage credentials, connections | Partial | persisted; `READ_FILES`/`WRITE_FILES` on the matching external location is required for path-based SQL (`delta.\`s3://…\``, `COPY INTO`, `LOCATION`); no cloud-IAM credential vending |
+| Grants / effective permissions | Partial | full privilege set with ownership, inheritance and `ALL_PRIVILEGES`; **enforced** on every UC REST call and on every SQL statement (notebooks, jobs, SQL editor, Statement API all go through `execute_sql → prepare_sql`); `effective-permissions` reports `inherited_from`. Missing: `DENY`, `ON ALL TABLES IN SCHEMA`, nested groups, column-level privileges. Verified by `tests/smoke/uc-lakebase-smoke.sh` |
+| SQL `GRANT` / `REVOKE` / `SHOW GRANTS` / `ALTER … OWNER TO` | Partial | Databricks grammar subset (multi-word privileges, explicit securable keywords, inferred type from name arity); `SHOW GRANTS TO principal` across the metastore not supported |
+| Row filters and column masks | Partial | attached via Lakeforge REST routes and applied by query rewrite to every reader (owners/admins included); `ALTER TABLE … SET ROW FILTER` / `ALTER COLUMN … SET MASK` SQL syntax not parsed; statements `sqlparser` cannot parse are privilege-checked by text fallback but **not rewritten**, so policies are skipped for them (LF-003) |
+| SQL UDFs, session functions | Partial | `CREATE [OR REPLACE] FUNCTION … RETURN <expr>` persisted in UC and inlined into statements; `current_user()`, `current_catalog()`, `current_schema()`, `is_account_group_member()`; no Python/table UDFs |
+| Audit log | Partial | every mutating REST call + SQL statements (incl. denials) in `system.access.audit` and `/api/2.0/lakeforge/audit`; not the full Databricks event schema |
+| Lineage (table, column) | Partial | captured from executed SQL; `lineage-tracking` API; column lineage limited to direct projections; notebook/job attribution not wired |
+| System tables + `information_schema` | Partial | `system.{access,query,compute,lakeflow,billing,mlflow,serving,lakebase}` and `information_schema.*` queryable from SQL (materialised on demand as Delta); `billing.usage` synthesised; no streaming refresh |
+| Tags, constraints, workspace bindings, artifact allowlists, temp table credentials | Partial | persisted with Databricks shapes; constraints not enforced by the engine; temp credentials return a Lakeforge Files-API token, not a cloud credential |
+| Models in Unity Catalog | Missing | workspace MLflow registry only |
+| Delta Sharing | Missing | securable types/grants exist, no shares API or protocol server |
+| Lakehouse Federation | Missing | connections stored only; Forge has no PostgreSQL table provider |
+
+Detailed per-capability status: [uc-lakebase-status.md](uc-lakebase-status.md).
+
+## Lakebase (managed PostgreSQL)
+
+| Area | Status | Notes |
+| --- | --- | --- |
+| Database instances API (`/api/2.0/database/instances`, roles, `findByUid`) | API only | lifecycle `STARTING→AVAILABLE`, capacities, parent refs are **metadata emulation**; no PostgreSQL server is started |
+| Credentials (`/api/2.0/database/credentials`) | API only | short-lived Lakeforge token, **not a PostgreSQL password**; response carries `backend: emulated\|external` |
+| Database catalogs in UC | API only | UC catalog of type `DATABASE_CATALOG` registered; not queryable from Forge |
+| Synced tables | API only | validation + simulated `PROVISIONING→ONLINE_*` states; no Delta→PostgreSQL data movement |
+| External PostgreSQL (`LAKEFORGE_LAKEBASE_POSTGRES_URL`) | Partial | reported in metadata; roles/databases not provisioned |
+| Lakebase UI, SDK service, Helm/Terraform PostgreSQL | Missing | |
 
 ## Workflows
 
@@ -122,7 +142,8 @@ assumed missing.
 | Workspace conf, IP access lists, settings | API only | persisted; IP lists not enforced |
 | SSO / SAML / OIDC login | Missing | local accounts only |
 | Account console, multi-workspace, Unity Catalog cross-workspace | Missing | one workspace per deployment |
-| Audit logs, compliance (HIPAA, PCI), customer-managed keys, private link | Missing | |
+| Audit logs | Partial | mutating REST calls + SQL in `system.access.audit` (see Unity Catalog) |
+| Compliance (HIPAA, PCI), customer-managed keys, private link | Missing | |
 
 ## Platform & deployment
 
@@ -138,7 +159,9 @@ assumed missing.
 Every Databricks *product area* has a home in Lakeforge and the daily
 developer loop is real. The deepest gaps are: Structured Streaming, the full
 PySpark DataFrame API, Delta `MERGE`/`OPTIMIZE`/`VACUUM`, serverless compute,
-Python DLT with expectations/CDC, Unity Catalog lineage and Models-in-UC,
-Feature Store / Vector Search / Mosaic AI, SSO, account-level multi-workspace
-administration, and **fine-grained authorization** (object ACLs and UC grants
-are stored but not enforced — treat every workspace user as trusted).
+Python DLT with expectations/CDC, Models-in-UC, Delta Sharing and
+federation, a real Lakebase data plane (PostgreSQL provisioning and synced
+tables), Feature Store / Vector Search / Mosaic AI, SSO, account-level
+multi-workspace administration, and **workspace object ACLs** (stored but not
+enforced on cluster/job/notebook routes). Unity Catalog grants *are* enforced
+on UC REST calls and on all SQL; see [uc-lakebase-status.md](uc-lakebase-status.md).

@@ -92,8 +92,12 @@ deploy/docker/     Dockerfile.api, Dockerfile.forge, docker-compose.yml
 deploy/helm/       lakeforge Helm chart
 deploy/terraform/  aws/, gcp/, azure/ roots + shared modules/lakeforge
 deploy/deploy.sh   one-click deploy / destroy for every target
-docs/              architecture, deployment, parity matrix
+docs/              architecture, development, API surface, status, parity, plan, issues, handoff
+openspec/          OpenSpec specifications (specs/) and change proposals (changes/)
+tests/smoke/       end-to-end API smoke scripts (platform, Unity Catalog + Lakebase)
 ```
+
+New here? Start with [docs/handoff.md](docs/handoff.md).
 
 ## Development
 
@@ -102,6 +106,8 @@ cargo test --workspace                         # engine + control plane tests
 cargo clippy --workspace --all-targets -- -D warnings
 (cd python/lakeforge-sdk && python -m pytest)  # SDK tests
 (cd web && npm run lint && npm run build)      # UI
+bash tests/smoke/platform-smoke.sh             # against a running API: clusters, SQL, notebooks, jobs, …
+bash tests/smoke/uc-lakebase-smoke.sh          # UC grants/policies/lineage/system tables + Lakebase
 helm lint deploy/helm/lakeforge
 for d in deploy/terraform/{modules/lakeforge,aws,gcp,azure}; do (cd $d && terraform init -backend=false && terraform validate); done
 ```
@@ -117,9 +123,17 @@ and on `v*` tags.
 Lakeforge is a working platform, not a finished Databricks replacement. The
 core loop — log in, create a cluster, run notebooks and SQL against Delta
 tables in Unity Catalog, schedule multi-task jobs, track MLflow experiments,
-register and serve models, deploy to a cloud — works end to end. Many
-Databricks features are implemented at API level only, approximated, or
-missing; [docs/parity.md](docs/parity.md) lists each one with its status.
+register and serve models, deploy to a cloud — works end to end. Unity
+Catalog privileges are enforced on every UC API call and every SQL
+statement, with row filters, column masks, SQL UDFs, audit, lineage and
+queryable system tables; Lakebase is a Databricks-shaped control plane with
+**metadata emulation only** (no PostgreSQL yet). Many other Databricks
+features are implemented at API level only, approximated, or missing;
+[docs/parity.md](docs/parity.md) lists each one with its status and
+[docs/uc-lakebase-status.md](docs/uc-lakebase-status.md) details governance
+and Lakebase. The plan to continue is in
+[docs/continuation-plan.md](docs/continuation-plan.md) with work items in
+[docs/issues.md](docs/issues.md) and specs in [openspec/](openspec/).
 
 ## License
 
