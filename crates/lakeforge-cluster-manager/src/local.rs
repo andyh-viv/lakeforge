@@ -1,7 +1,7 @@
 //! Local-process backend: runs the Forge driver and executors as child
 //! processes of the control plane using the `forge` binary.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -26,16 +26,6 @@ pub struct LocalProcessBackend {
     /// mistaken for a live one — the mistake that a bare `kill -0` probe makes on
     /// platforms without `/proc`.
     children: Arc<Mutex<HashMap<u32, tokio::process::Child>>>,
-    /// Pids we have observed exiting, most recent last (bounded).
-    ///
-    /// The registry sweep collects a child's handle as soon as it is observed to
-    /// have exited, which is what keeps the map bounded. That must not cost the
-    /// authoritative answer: a cluster whose driver was reaped by another
-    /// cluster's sweep must still be told "dead", not be pushed onto the
-    /// best-effort probe (which on platforms without `/proc` cannot tell a zombie
-    /// from a live process, and on non-Unix assumes alive). Recording the pids we
-    /// reaped preserves that answer for the owner that has not queried it yet.
-    recently_exited: Arc<Mutex<VecDeque<u32>>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -60,7 +50,6 @@ impl LocalProcessBackend {
             work_root,
             host: "127.0.0.1".into(),
             children: Arc::new(Mutex::new(HashMap::new())),
-            recently_exited: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -90,9 +79,6 @@ impl LocalProcessBackend {
         Ok(pid)
     }
 
-    /// How many recently-exited pids we remember: enough to answer the clusters a
-    /// monitor tick covers, bounded so a long-lived control plane cannot grow.
-    const RECENTLY_EXITED_CAP: usize = 256;
     /// Poll interval while waiting for a signalled child to exit, and the number
     /// of polls in the polite (SIGTERM) and escalated (SIGKILL) phases. Both
     /// phases are ~1s, so cleanup is bounded and cannot block termination.
@@ -110,38 +96,20 @@ impl LocalProcessBackend {
         self.children.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The recently-exited pid ring, tolerating a poisoned mutex.
-    fn recently_exited(&self) -> std::sync::MutexGuard<'_, VecDeque<u32>> {
-        self.recently_exited.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// Remember pids we observed exiting (bounded, oldest evicted first).
-    fn remember_exited(&self, pids: &[u32]) {
-        if pids.is_empty() {
-            return;
-        }
-        let mut recent = self.recently_exited();
-        for pid in pids {
-            if recent.len() >= Self::RECENTLY_EXITED_CAP {
-                recent.pop_front();
-            }
-            recent.push_back(*pid);
-        }
-    }
-
-    /// Whether we observed `pid` exiting. Authoritative for a process we spawned.
-    fn was_reaped(&self, pid: u32) -> bool {
-        self.recently_exited().iter().any(|p| *p == pid)
-    }
-
-    /// Reap every retained child that has already exited, dropping its handle and
-    /// remembering the pid.
+    /// Reap every retained child that has already exited and that no cluster's
+    /// state refers to any more, dropping its handle.
     ///
     /// A retained handle for an exited child is a zombie nothing else will reap,
-    /// and it keeps the map growing. Sweeping the *whole* registry (rather than
-    /// only the pids in one cluster's state) is what collects children whose pids
-    /// have already left state — executors removed by [`Self::resize`], and a
-    /// driver's executors after the driver itself has exited.
+    /// and it keeps the map growing. Sweeping the *whole* registry is what collects
+    /// children whose pids have already left state — executors removed by
+    /// [`Self::resize`], and a dead driver's executors.
+    ///
+    /// Pids in `referenced` are deliberately NOT collected: those belong to a
+    /// cluster that still holds a handle for them, and that cluster will consume
+    /// the exit itself through [`Self::pid_live`]. Collecting them here would
+    /// discard an authoritative answer and hand the pid back to the best-effort
+    /// probe. This is why the guarantee does not depend on any retention window:
+    /// a referenced pid is never evicted, however many children exited at once.
     ///
     /// A `try_wait` failure is isolated to that child: it is logged with its pid,
     /// the handle is kept, and the sweep continues. It is deliberately NOT
@@ -149,12 +117,15 @@ impl LocalProcessBackend {
     /// unqueryable child must not stop reconciliation for every other cluster; a
     /// cluster that actually owns such a child still receives the error from
     /// [`Self::pid_live`]. Returns the number of children reaped.
-    fn sweep_exited(&self) -> usize {
+    fn sweep_exited(&self, referenced: &[u32]) -> usize {
         let mut reaped = 0usize;
         let mut done: Vec<u32> = Vec::new();
         {
             let mut children = self.children();
             for (pid, child) in children.iter_mut() {
+                if referenced.contains(pid) {
+                    continue;
+                }
                 match child.try_wait() {
                     Ok(Some(_)) => {
                         done.push(*pid);
@@ -170,7 +141,6 @@ impl LocalProcessBackend {
                 children.remove(pid);
             }
         }
-        self.remember_exited(&done);
         reaped
     }
 
@@ -197,7 +167,6 @@ impl LocalProcessBackend {
                 children.remove(pid);
             }
         }
-        self.remember_exited(&done);
         still
     }
 
@@ -287,17 +256,12 @@ impl LocalProcessBackend {
             return Err(ClusterError::Backend(format!("querying child process {pid}: {e}")));
         }
         if exited {
-            self.remember_exited(&[pid]);
             return Ok(false);
         }
-        // No handle. Another cluster's sweep may have already collected it — and
-        // that a process we spawned was seen exiting is authoritative, so do not
-        // discard it (and do not fall through to the best-effort probe, which on
-        // platforms without `/proc` cannot tell a zombie from a live process and
-        // on non-Unix assumes alive).
-        if self.was_reaped(pid) {
-            return Ok(false);
-        }
+        // No handle: this is either a pid we never spawned (the probe is the right
+        // answer) or one whose handle was already collected because no cluster state
+        // referenced it. `sweep_exited` never collects a referenced pid, so a cluster
+        // that still refers to this pid has already consumed its exit above.
         Ok(pid_alive(pid))
     }
 
@@ -389,10 +353,14 @@ impl ClusterBackend for LocalProcessBackend {
             }
         }
         // Then collect children whose pids no cluster state refers to any more
-        // (executors removed by `resize`, and a dead driver's executors). Failures
-        // are logged per child and never propagated: one unqueryable child must
-        // not stop reconciliation for every other cluster.
-        self.sweep_exited();
+        // (executors removed by `resize`, and a dead driver's executors). This
+        // cluster's own pids are passed as `referenced` so another cluster's sweep
+        // can never collect them and take away an answer this cluster has not read
+        // yet. Failures are logged per child and never propagated: one unqueryable
+        // child must not stop reconciliation for every other cluster.
+        let mut referenced = st.executor_pids.clone();
+        referenced.push(st.driver_pid);
+        self.sweep_exited(&referenced);
         if !driver_alive {
             return Ok(BackendStatus {
                 state: BackendState::Terminated,
@@ -445,7 +413,10 @@ impl ClusterBackend for LocalProcessBackend {
         // the escalated kill surfaces as an error so the caller can keep the state
         // and retry rather than believe cleanup succeeded and strand a live process.
         self.reap_pids(&pids).await?;
-        self.sweep_exited();
+        // Everything this cluster referred to has just been reaped, so nothing is
+        // referenced any more: sweep the rest (orphaned executors from earlier
+        // scale-downs, and children whose state was already dropped).
+        self.sweep_exited(&[]);
         Ok(())
     }
 }
@@ -525,7 +496,7 @@ fn kill(_pid: u32) {}
 mod tests {
     use super::{pid_alive, LocalProcessBackend};
     use crate::ClusterBackend;
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::process::Stdio;
     use std::sync::{Arc, Mutex};
@@ -541,7 +512,6 @@ mod tests {
             work_root: PathBuf::from("/tmp"),
             host: "127.0.0.1".into(),
             children: Arc::new(Mutex::new(HashMap::new())),
-            recently_exited: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -696,7 +666,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut reaped = 0usize;
         while Instant::now() < deadline {
-            reaped += be.sweep_exited();
+            reaped += be.sweep_exited(&[]);
             if reaped >= 3 {
                 break;
             }
@@ -732,10 +702,11 @@ mod tests {
         let driver_pid = child.id().expect("pid");
         be.children().insert(driver_pid, child);
 
-        // Another cluster's `status()` sweep gets there first.
+        // Another cluster's `status()` sweep gets there first — it does not refer to
+        // this pid, so it is free to collect it.
         let deadline = Instant::now() + Duration::from_secs(10);
         while be.children().get(&driver_pid).is_some() && Instant::now() < deadline {
-            be.sweep_exited();
+            be.sweep_exited(&[]);
             if be.children().get(&driver_pid).is_some() {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -759,25 +730,83 @@ mod tests {
 
     // The recorded exit must take precedence over the platform probe. This is what
     // keeps a pid we watched exit from being handed back to a probe that cannot
-    // tell a zombie from a live process (and that on non-Unix assumes alive). It is
-    // deliberately white-box: the pid is recorded as exited while the process is in
-    // fact still running, because that is the only way to observe the precedence on
-    // a platform where the probe would otherwise agree. The ring only ever receives
-    // pids we observed exiting, so the precedence is what production relies on.
-    #[tokio::test]
-    async fn recorded_exit_takes_precedence_over_the_probe() {
-        let be = backend();
-        let (pid, mut guard) = spawn_guarded("sleep", &["30"]);
-        assert!(pid_alive(pid), "the process really is alive");
+    // tell a zombie from a live process (and that on non-Unix assumes alive).
+    //
+    // Review finding: the guarantee must not depend on capacity. A sweep must never
+    // collect a pid that a cluster state still refers to, however many children
+    // exited at once — the owner consumes that exit itself.
+    async fn spawn_tracked(be: &LocalProcessBackend, secs: &str) -> u32 {
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg(secs)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
+        let child = cmd.spawn().expect("spawn tracked child");
+        let pid = child.id().expect("pid");
+        be.children().insert(pid, child);
+        pid
+    }
 
-        be.remember_exited(&[pid]);
+    #[tokio::test]
+    async fn sweep_exited_retains_pids_its_cluster_still_references() {
+        let be = backend();
+        let pid = spawn_tracked(&be, "0.3").await;
+
+        // The child exits on its own while this cluster still refers to its pid.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut collected_referenced = 0usize;
+        while Instant::now() < deadline {
+            collected_referenced += be.sweep_exited(&[pid]);
+            assert!(
+                be.children().get(&pid).is_some(),
+                "a referenced pid must never be collected by a sweep"
+            );
+            if !be.pid_live(pid).expect("pid_live") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            collected_referenced, 0,
+            "the sweep must not collect a pid its cluster still references"
+        );
         assert!(
             !be.pid_live(pid).expect("pid_live"),
-            "a pid we recorded as exited must read dead even if a probe would say alive"
+            "the owning cluster must still learn the child exited"
         );
+        assert!(
+            be.children().get(&pid).is_none(),
+            "the owner's own query is what reaps and forgets it"
+        );
+    }
 
-        guard.0.kill().expect("kill sleep");
-        guard.0.wait().expect("reap sleep");
+    // Review finding: with a capacity-bounded retention window, a pid's
+    // authoritative exit could be evicted before its owner read it. This pins that
+    // no such window exists: every unreferenced exited child is collected in one
+    // pass, and a referenced one is held, however many exit at once.
+    #[tokio::test]
+    async fn sweep_exited_collects_many_unreferenced_handles_in_one_pass() {
+        let be = backend();
+        const N: usize = 300;
+
+        for _ in 0..N {
+            spawn_tracked(&be, "0.05").await;
+        }
+        assert_eq!(be.children().len(), N, "all children are registered");
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut reaped = 0usize;
+        while reaped < N && Instant::now() < deadline {
+            reaped += be.sweep_exited(&[]);
+            if reaped < N {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        assert_eq!(reaped, N, "every unreferenced exited child must be collected, got {reaped} of {N}");
+        assert!(be.children().is_empty(), "no handle may be retained after the sweep");
     }
 
     // Review finding: a child that ignores the polite signal must not be left

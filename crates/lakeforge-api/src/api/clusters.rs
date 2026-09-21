@@ -224,6 +224,16 @@ impl AppState {
         if matches!(c.state, ClusterState::Running | ClusterState::Pending | ClusterState::Restarting) {
             return Ok(());
         }
+        // A cluster whose termination could not finish still holds the only handle
+        // to a process that survived cleanup. Launching a replacement here would
+        // overwrite that handle and strand the process, so refuse until the cleanup
+        // is completed or retried.
+        if matches!(c.state, ClusterState::Terminating) && c.handle.is_some() {
+            return Err(ApiError::invalid(format!(
+                "cluster {id} is still terminating ({})",
+                c.state_message
+            )));
+        }
         c.state = ClusterState::Pending;
         c.state_message = "Launching Forge driver and executors".into();
         c.start_time = now_ms();
@@ -348,6 +358,16 @@ impl AppState {
         for doc in clusters {
             let mut c = doc.data;
             let Some(h) = c.handle.clone() else { continue };
+            if matches!(c.state, ClusterState::Terminating) {
+                // A previous termination could not reap every process. Retry it here
+                // rather than leaving the handle — and the process it points at —
+                // unattended; `terminate_cluster` keeps the handle on failure.
+                let cid = c.cluster_id.clone();
+                if let Err(e) = self.terminate_cluster(&cid, "USER_REQUEST").await {
+                    tracing::warn!(cluster = %cid, error = %e, "retrying incomplete termination failed");
+                }
+                continue;
+            }
             if !matches!(c.state, ClusterState::Running | ClusterState::Pending) {
                 continue;
             }
@@ -576,7 +596,13 @@ async fn delete(State(st): State<S>, Body(b): Body<IdBody>) -> ApiResult<Json<Va
 }
 
 async fn permanent_delete(State(st): State<S>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
-    let _ = st.terminate_cluster(&b.cluster_id, "USER_REQUEST").await;
+    // The record is the last reference to this cluster's processes. If cleanup
+    // fails, deleting anyway would strand them with nothing pointing at them, so
+    // surface the failure instead of ignoring it. A cluster that is already gone is
+    // still an idempotent success.
+    if st.get_cluster(&b.cluster_id).await.is_ok() {
+        st.terminate_cluster(&b.cluster_id, "USER_REQUEST").await?;
+    }
     st.store.delete(KIND, &b.cluster_id).await?;
     st.store.delete_children(KIND_EVENT, &b.cluster_id).await?;
     Ok(empty())
