@@ -44,27 +44,41 @@ Consequences on macOS (`main` @ 993cbd7):
    reachable. No new crate dependency (`libc` is not added).
 3. **The handle registry is swept, so nothing is leaked or stranded.** A retained
    handle for an exited child is a zombie nothing else will reap, and it grows the
-   map. `reap_exited()` sweeps the *whole* registry and is called from `status()`
+   map. `sweep_exited()` sweeps the *whole* registry and is called from `status()`
    and `terminate()`, which is what collects children whose pids have already left
    cluster state: executors removed by `resize()` (whose pids are dropped from
-   state) and a dead driver's executors. `resize()` also reaps the executors it
-   removes directly, and `terminate()` reaps its own pids with a bounded wait
-   before sweeping, so a torn-down cluster is collected even if a process exits
-   after the handle is cleared. Sweeps are bounded and never block on an
-   unresponsive process. The registry lock tolerates poisoning (a panic while held
-   would otherwise take down the API's cluster monitor loop).
+   state) and a dead driver's executors. A failing `try_wait` during a sweep is
+   logged with its pid and isolated to that child — it is not returned as an
+   error, because `status()` runs once per cluster and one unqueryable child must
+   not stop reconciliation for every other cluster. Pids observed exiting are kept
+   in a bounded ring so a cluster whose child another cluster's sweep collected is
+   still told "dead" instead of being handed to the probe.
+   `resize()` reaps the executors it removes directly, and `terminate()` reaps its
+   own pids before sweeping. `reap_pids()` escalates from the polite signal to an
+   uncatchable one and returns an error if a process survives both, so a cluster
+   handle is never cleared while a live process remains. Sweeps are bounded and
+   never block on an unresponsive process. The registry lock tolerates poisoning (a
+   panic while held would otherwise take down the API's cluster monitor loop).
 4. **Regression tests** in `local.rs`'s `#[cfg(test)] mod tests`:
    - `pid_alive_tracks_liveness_portably` — a live child reports alive, a killed
      *and reaped* child reports dead, pid `0` reports dead. Does not touch
      `/proc`, so it fails on the original implementation on macOS.
-   - `exited_but_unreaped_tracked_child_reports_dead` — a retained child that
-     exits on its own, never `wait()`ed by the test, must report dead and be
-     dropped from the handle map. This is the first review finding: a bare
-     `kill -0` probe reports a zombie as alive. Verified to fail against that probe.
-   - `reap_exited_collects_handles_whose_pids_left_cluster_state` — three exited
-     children whose pids appear in no cluster state must all be collected by the
-     registry sweep. This is the second review finding (the `resize` leak);
-     verified to fail when the sweep is removed.
+   - `exited_but_unreaped_tracked_child_reports_dead` — a retained child that is
+     stopped and left unreaped must report dead and be dropped from the handle
+     map. This is the first review finding: a bare `kill -0` probe reports a
+     zombie as alive. Verified to fail against that probe.
+   - `sweep_exited_collects_handles_whose_pids_left_cluster_state` — three exited
+     children whose pids appear in no cluster state must all be collected, and
+     must still read dead afterwards. This is the second review finding (the
+     `resize` leak); verified to fail when the sweep is removed.
+   - `status_reports_terminated_for_a_driver_reaped_by_another_sweep` — the
+     `status()` wiring around the sweep, not just the mechanism.
+   - `recorded_exit_takes_precedence_over_the_probe` — a recorded exit is not
+     downgraded to the platform probe; verified to fail without the precedence.
+   - `reap_pids_force_kills_a_child_that_ignores_the_polite_signal` — a child that
+     ignores SIGTERM is force-killed rather than left running; the child signals
+     readiness first so the test cannot pass for the wrong reason, and it is
+     verified to fail when the escalation is removed.
    - `pid_zero_is_never_live` — the pid-0 invariant holds through both paths.
 
 The required cases hold on Linux **and** macOS: (a) a live process → alive;
@@ -79,7 +93,8 @@ dead.
 ## Non-scope
 
 - The smoke scripts (`tests/smoke/*.sh`) — that is LF-028, a separate PR.
-- `resize`, `launch`, port allocation, and the Kubernetes backend.
+- `launch`, port allocation, and the Kubernetes backend. (`resize` **is** touched:
+  it now reaps the executors it removes instead of leaking their handles.)
 - Fixing the orphan-process leak with process supervision — recorded below as
   a known limitation of this change.
 - No new crates, no rustfmt sweep, no unrelated refactors.

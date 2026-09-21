@@ -845,25 +845,38 @@ Conventions for every issue:
   TERMINATED after 60s), `tests/smoke/uc-lakebase-smoke.sh` = `passed=49
   failed=1`; Linux CI reports 39/39 and 50/50; CI control-plane smoke never
   creates a cluster.
-- **Scope**: `pid_alive` only. Keep the `/proc` implementation for Linux
-  (zombie-aware), add a portable `kill -0` probe for other Unix targets, keep
-  the non-Unix fallback, treat pid 0 as never alive. Regression test in
-  `local.rs` `mod tests`.
-- **Proposed implementation**: `#[cfg(target_os = "linux")]` keeps the
-  `/proc` form; `#[cfg(all(unix, not(target_os = "linux")))]` runs
-  `std::process::Command::new("kill").arg("-0").arg(pid).status()` and treats
-  exit 0 as alive. No new crate dependency (`libc` is not added).
+- **Scope**: cluster liveness in the local backend. Liveness for the driver and
+  executors the backend spawns is answered from the retained child handle
+  (`Child::try_wait`, which reports *and reaps*), so an exited — even
+  not-yet-reaped — process reads dead on every platform; the `/proc` form is kept
+  for Linux, a `kill -0` probe covers other Unix targets for pids we do not hold,
+  pids we observed exiting are remembered so a sweep cannot downgrade their
+  answer, and pid 0 is never alive. Cleanup reaps the handles it holds and
+  escalates to an uncatchable signal. Regression tests in `local.rs` `mod tests`.
+- **Proposed implementation**: as built — `LocalProcessBackend` retains
+  `tokio::process::Child` handles plus a bounded ring of recently-exited pids;
+  `status()` queries its own pids first (authoritative) and then sweeps the
+  registry for children whose pids left cluster state (logged per child, never
+  propagated across clusters); `reap_pids()` escalates from the polite signal to
+  SIGKILL and returns an error rather than reporting a false success. No new crate
+  dependency (`libc` is not added).
 - **Dependencies**: none.
-- **Acceptance criteria**: a live child reports alive, a reaped child reports
-  dead, pid 0 reports dead, on Linux and macOS; `cargo test -p
-  lakeforge-cluster-manager` passes; clippy clean.
-- **Focused tests**: `cargo test -p lakeforge-cluster-manager`
-  (`pid_alive_tracks_liveness_portably`); fails on the old `/proc`-only form
-  on macOS.
-- **Docs/parity**: this entry; OpenSpec change
-  `fix-cluster-liveness-portability`.
-- **OpenSpec**: `openspec/changes/fix-cluster-liveness-portability/
-  specs/cluster-lifecycle/spec.md`.
+- **Acceptance criteria**: a live child reports alive, an exited (reaped or not)
+  child reports dead, pid 0 reports dead, on Linux and macOS; `cargo test -p
+  lakeforge-cluster-manager` passes; clippy clean; macOS `platform-smoke.sh`
+  reaches `passed=39 failed=0`.
+- **Focused tests**: `cargo test -p lakeforge-cluster-manager` — seven tests,
+  including `pid_alive_tracks_liveness_portably`,
+  `exited_but_unreaped_tracked_child_reports_dead`,
+  `sweep_exited_collects_handles_whose_pids_left_cluster_state`,
+  `status_reports_terminated_for_a_driver_reaped_by_another_sweep`,
+  `recorded_exit_takes_precedence_over_the_probe` and
+  `reap_pids_force_kills_a_child_that_ignores_the_polite_signal`. The liveness
+  test fails on the old `/proc`-only form on macOS.
+- **Docs/parity**: this entry; archived OpenSpec change
+  `2026-09-21-fix-cluster-liveness-portability`.
+- **OpenSpec**: archived — `openspec/changes/archive/2026-09-21-fix-cluster-liveness-portability/`;
+  live spec `openspec/specs/cluster-lifecycle/spec.md`.
 
 ---
 

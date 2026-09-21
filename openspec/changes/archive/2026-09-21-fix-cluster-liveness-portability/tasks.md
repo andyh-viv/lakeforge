@@ -53,9 +53,36 @@ Tick items as they land. `[x]` = on branch
       storing pid `0`
 - [x] 2b.7 Regression test `reap_exited_collects_handles_whose_pids_left_cluster_state`;
       verified to FAIL when the sweep is removed
-- [x] 2b.8 Make `exited_but_unreaped_tracked_child_reports_dead` robust (child
-      `sleep 1`, no immediate-assert race) and drop the stale-guard nit in favour
-      of a bounded child lifetime, documented in the test
+- [x] 2b.8 Make `exited_but_unreaped_tracked_child_reports_dead` deterministic:
+      the child is stopped through its retained handle instead of being raced with
+      a short sleep, and it is long-lived so a failing assertion cannot linger
+
+## 2c. Review remediation, round 3 (gpt-5.6-sol, the governance-permitted reviewer)
+
+- [x] 2c.1 Isolate sweep failures per child: `sweep_exited()` logs each failing
+      pid and never returns an error, so one unqueryable child cannot stop
+      reconciliation for every other cluster (`status()` runs per cluster); a
+      cluster that owns such a child still gets the error from `pid_live`
+- [x] 2c.2 Preserve the authoritative answer across the sweep: pids observed
+      exiting are kept in a bounded ring, and `pid_live` consults it rather than
+      falling through to the probe when the handle is already gone
+- [x] 2c.3 `status()` queries its own pids before sweeping, and queries executors
+      even when the driver is already dead, so their exits are reaped too
+- [x] 2c.4 Escalate cleanup: `reap_pids()` force-kills a child that survives the
+      polite signal and returns an error rather than reporting a false success, so
+      a cluster handle is not cleared while a live process remains
+- [x] 2c.5 Regression test `status_reports_terminated_for_a_driver_reaped_by_another_sweep`
+      (the `status()` wiring, not just the sweep mechanism)
+- [x] 2c.6 Regression test `recorded_exit_takes_precedence_over_the_probe` —
+      verified to FAIL when the precedence is removed
+- [x] 2c.7 Regression test `reap_pids_force_kills_a_child_that_ignores_the_polite_signal`,
+      with a readiness handshake so the signal cannot land before the child
+      installs its ignore-trap — verified to FAIL when the escalation is removed
+      (without the handshake it passed for the wrong reason)
+- [x] 2c.8 Correct the remaining overclaims: the live spec's `SUSPENDED` state
+      (neither `BackendState` nor `ClusterState` defines it), `resize` listed as
+      non-scope while it was changed, the post-handle-clear claim, the test count
+      and the stale scope/OpenSpec path in `docs/issues.md`
 - [x] 2b.9 Qualify the "exited ⇒ dead" claim in `proposal.md` to retained handles,
       and add the sweep requirement/scenarios to the spec delta
 
@@ -71,7 +98,7 @@ Tick items as they land. `[x]` = on branch
 
 ## 4. Verification
 
-- [x] 4.1 `cargo test -p lakeforge-cluster-manager` passes (3 tests)
+- [x] 4.1 `cargo test -p lakeforge-cluster-manager` passes (7 tests)
 - [x] 4.2 `cargo clippy --workspace --all-targets -- -D warnings` is clean
 - [x] 4.3 `openspec validate --changes` passes for this change
 - [x] 4.4 `tests/smoke/platform-smoke.sh` reaches `passed=39 failed=0` on macOS
