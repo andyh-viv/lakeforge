@@ -870,7 +870,9 @@ Conventions for every issue:
   success. No new crate dependency (`libc` is not added).
 - **Dependencies**: none.
 - **Acceptance criteria**: a live child reports alive, an exited (reaped or not)
-  child reports dead, pid 0 reports dead, on Linux and macOS; `cargo test -p
+  child reports dead **for a pid the backend holds a handle for** (for an untracked
+  pid, best-effort only: a dead-but-unreaped pid can read alive — LF-030), pid 0
+  reports dead, on Linux and macOS; `cargo test -p
   lakeforge-cluster-manager` passes; clippy clean; macOS `platform-smoke.sh`
   reaches `passed=39 failed=0`.
 - **Focused tests**: `cargo test -p lakeforge-cluster-manager` — nine tests,

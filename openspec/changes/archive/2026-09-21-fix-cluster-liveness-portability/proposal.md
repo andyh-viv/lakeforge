@@ -139,7 +139,9 @@ API-layer regression tests in `clusters.rs` (scripted mock backend):
      `DRIVER_UNREACHABLE`, not `USER_REQUEST`.
 
 The required cases hold on Linux **and** macOS: (a) a live process → alive;
-(b) an exited process → dead whether or not it has been reaped; (c) pid `0` →
+(b) an exited process → dead whether or not it has been reaped, **for a pid the
+backend holds a child handle for** (the untracked case is best-effort and can read
+alive for a dead-but-unreaped pid; see LF-030); (c) pid `0` →
 dead.
 
 ## Scope

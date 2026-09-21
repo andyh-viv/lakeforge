@@ -68,9 +68,11 @@ Tick items as they land. `[x]` = on branch
       reconciliation for every other cluster (the sweep runs once per tick via
       `reap_orphans`); a cluster that owns such a child still gets the error from
       `pid_live`
-- [x] 2c.2 Preserve the authoritative answer across the sweep: pids observed
-      exiting are kept in a bounded ring, and `pid_live` consults it rather than
-      falling through to the probe when the handle is already gone
+- [x] 2c.2 Preserve the authoritative answer across the sweep — **SUPERSEDED in
+      round 4 (see 2d.1)**: this round's approach kept pids observed exiting in a
+      bounded ring that `pid_live` consulted. Round 4 removed the ring because it
+      made the guarantee capacity-dependent; the current mechanism is ownership-aware
+      retention (a sweep never collects a pid a cluster's state still references).
 - [x] 2c.3 `status()` queries only its own pids (the sweep moved off `status()`
       to the control-plane `reap_orphans` in round 5, 2e.1), and queries
       executors even when the driver is already dead, so their exits are reaped
@@ -82,7 +84,9 @@ Tick items as they land. `[x]` = on branch
       mechanism) — replaced in round 5 (2e.2) because it asserted the defective
       caller-pids-only sweep
 - [x] 2c.6 Regression test `recorded_exit_takes_precedence_over_the_probe` —
-      verified to FAIL when the precedence is removed
+      **DELETED in round 4**: it was a white-box test of the bounded ring that round 4
+      removed. Its replacement is `sweep_exited_retains_pids_its_cluster_still_references`,
+      which asserts the current ownership-aware guarantee instead.
 - [x] 2c.7 Regression test `reap_pids_force_kills_a_child_that_ignores_the_polite_signal`,
       with a readiness handshake so the signal cannot land before the child
       installs its ignore-trap — verified to FAIL when the escalation is removed
