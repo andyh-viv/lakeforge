@@ -106,3 +106,22 @@ jobs:
         run: docker compose -f deploy/docker/docker-compose.yml config > /dev/null
       - name: deploy.sh syntax
         run: bash -n deploy/deploy.sh
+
+  docs-drift:
+    name: Docs drift (warn-only)
+    runs-on: ubuntu-latest
+    # Warn-only while the repo still carries drift (LF-026). The checker itself
+    # exits 0 in warn-only mode; `continue-on-error` keeps a new finding from
+    # blocking a merge until the backlog is cleared, at which point both this flag
+    # and the checker can be switched to --strict.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checker syntax
+        run: |
+          bash -n scripts/check-docs.sh
+          bash -n tests/check-docs.sh
+      - name: Checker self-test (fixtures)
+        run: bash tests/check-docs.sh
+      - name: Docs drift report
+        run: bash scripts/check-docs.sh

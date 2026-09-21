@@ -132,6 +132,7 @@ curl -s -X POST localhost:8080/api/2.0/sql/statements -H "Authorization: Bearer 
 | Platform smoke | `bash tests/smoke/platform-smoke.sh` (API running, fresh state) | `passed=N failed=0` |
 | UC + Lakebase smoke | `bash tests/smoke/uc-lakebase-smoke.sh` (API running) | `passed=50 failed=0` |
 | Browser golden path | `.agents/skills/testing-workspace/SKILL.md` | manual / agent-driven |
+| Docs drift | `bash scripts/check-docs.sh` + `bash tests/check-docs.sh` (fixtures) | warn-only; `--strict` exits 1 on findings |
 
 Smoke tests are the only end-to-end coverage of SQL authorisation, policies,
 lineage, system tables and Lakebase today; unit coverage of those paths is an
@@ -162,6 +163,32 @@ open issue (see [issues.md](issues.md) #24).
 - **Tests.** Unit tests live next to the code (`#[cfg(test)] mod tests`);
   end-to-end behaviour goes in `tests/smoke/*.sh` as `check "name" "$(cmd)"
   'expected-substring'` lines, kept idempotent.
+
+### Docs drift checker
+
+`scripts/check-docs.sh` keeps the two most drift-prone documents honest:
+
+- **Routes**: every path registered with `.route("…")` under
+  `crates/lakeforge-api/src/api/*.rs` (plus `lib.rs`/`api/mod.rs`) is compared with
+  the backticked paths in `docs/api-surface.md`. Documented shorthand is expanded
+  before comparison — `{create,list,delete}` alternation and `[/{id}]` optionals —
+  so a family entry covers its real routes. A documented entry that is a strict
+  prefix of a registered route is reported separately as namespace/family
+  notation rather than as drift. Path parameters are compared as `{name}` and
+  `:name` equivalently, and trailing slashes are ignored.
+- **Issue references**: every `LF-###` defined in `docs/issues.md` must either be
+  referenced from an OpenSpec change under `openspec/changes/` or be marked done
+  (strikethrough title in the issue list).
+
+The checker reports what it could **not** parse (currently: nested shorthand
+groups) instead of silently skipping it, and CI runs it **warn-only**
+(`.github/workflows/ci.yml`, job `docs-drift`, `continue-on-error: true`). Run it
+with `--strict` to make it fail, and `--root DIR` to run it against a fixture
+tree (that is what `tests/check-docs.sh` does).
+
+Adding a route without documenting it, or deleting a documented one, is drift the
+checker will report — update `docs/api-surface.md` in the same PR rather than
+leaving the finding.
 
 ## Adding things — recipes
 
