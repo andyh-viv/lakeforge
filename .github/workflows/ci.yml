@@ -106,3 +106,21 @@ jobs:
         run: docker compose -f deploy/docker/docker-compose.yml config > /dev/null
       - name: deploy.sh syntax
         run: bash -n deploy/deploy.sh
+
+  docs-drift:
+    name: Docs drift (warn-only findings, gated checker)
+    runs-on: ubuntu-latest
+    # The checker's report is warn-only: it exits 0 when it finds drift, so drift
+    # findings stay advisory. "Warn-only" applies to FINDINGS only, not to the
+    # checker's own integrity. Syntax errors and a failing self-test MUST fail the
+    # job, so there is no `continue-on-error` here.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checker syntax
+        run: |
+          bash -n scripts/check-docs.sh
+          bash -n tests/check-docs.sh
+      - name: Checker self-test (fixtures)
+        run: bash tests/check-docs.sh
+      - name: Docs drift report (warn-only)
+        run: bash scripts/check-docs.sh
