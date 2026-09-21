@@ -1,7 +1,7 @@
 //! Local-process backend: runs the Forge driver and executors as child
 //! processes of the control plane using the `forge` binary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -104,20 +104,25 @@ impl LocalProcessBackend {
     /// children whose pids have already left state — executors removed by
     /// [`Self::resize`], and a dead driver's executors.
     ///
-    /// Pids in `referenced` are deliberately NOT collected: those belong to a
-    /// cluster that still holds a handle for them, and that cluster will consume
-    /// the exit itself through [`Self::pid_live`]. Collecting them here would
-    /// discard an authoritative answer and hand the pid back to the best-effort
-    /// probe. This is why the guarantee does not depend on any retention window:
-    /// a referenced pid is never evicted, however many children exited at once.
+    /// `referenced` is the COMPLETE set of pids referenced by every cluster's
+    /// state, collected by the control plane once per reconcile tick and passed
+    /// through [`ClusterBackend::reap_orphans`]. Pids in `referenced` are
+    /// deliberately NOT collected: those belong to a cluster that still holds a
+    /// handle for them, and that cluster will consume the exit itself through
+    /// [`Self::pid_live`]. Collecting them here would discard an authoritative
+    /// answer and hand the pid back to the best-effort probe. The set is copied
+    /// into a `HashSet` so membership is O(1) rather than a linear scan per child.
+    /// This is why the guarantee does not depend on any retention window: a
+    /// referenced pid is never evicted, however many children exited at once.
     ///
     /// A `try_wait` failure is isolated to that child: it is logged with its pid,
     /// the handle is kept, and the sweep continues. It is deliberately NOT
-    /// returned as an error, because `status()` runs once per cluster and one
+    /// returned as an error, because the sweep runs once per reconcile tick and one
     /// unqueryable child must not stop reconciliation for every other cluster; a
     /// cluster that actually owns such a child still receives the error from
     /// [`Self::pid_live`]. Returns the number of children reaped.
     fn sweep_exited(&self, referenced: &[u32]) -> usize {
+        let referenced: HashSet<u32> = referenced.iter().copied().collect();
         let mut reaped = 0usize;
         let mut done: Vec<u32> = Vec::new();
         {
@@ -341,10 +346,16 @@ impl ClusterBackend for LocalProcessBackend {
 
     async fn status(&self, handle: &ClusterHandle) -> Result<BackendStatus> {
         let st: LocalState = serde_json::from_value(handle.state.clone()).unwrap_or_default();
-        // Query this cluster's own pids FIRST. Each query is authoritative and
-        // consumes the exit, so the registry sweep below cannot take the answer
-        // away from another cluster that has not asked yet. Executors are queried
-        // even when the driver is already dead, so their exits are reaped too.
+        // Query this cluster's own pids. Each query is authoritative and
+        // consumes the exit. Executors are queried even when the driver is
+        // already dead, so their exits are reaped too.
+        //
+        // NOTE: `status()` deliberately does NOT sweep the registry here. A
+        // sweep needs the COMPLETE set of state-referenced pids, and a single
+        // cluster cannot see the other clusters' state; sweeping with only this
+        // cluster's pids would let it collect another cluster's referenced exit.
+        // The control plane sweeps instead, via [`ClusterBackend::reap_orphans`]
+        // with the full reference set.
         let driver_alive = self.pid_live(st.driver_pid)?;
         let mut ready = 0u32;
         for p in &st.executor_pids {
@@ -352,15 +363,6 @@ impl ClusterBackend for LocalProcessBackend {
                 ready += 1;
             }
         }
-        // Then collect children whose pids no cluster state refers to any more
-        // (executors removed by `resize`, and a dead driver's executors). This
-        // cluster's own pids are passed as `referenced` so another cluster's sweep
-        // can never collect them and take away an answer this cluster has not read
-        // yet. Failures are logged per child and never propagated: one unqueryable
-        // child must not stop reconciliation for every other cluster.
-        let mut referenced = st.executor_pids.clone();
-        referenced.push(st.driver_pid);
-        self.sweep_exited(&referenced);
         if !driver_alive {
             return Ok(BackendStatus {
                 state: BackendState::Terminated,
@@ -409,15 +411,28 @@ impl ClusterBackend for LocalProcessBackend {
             kill(*pid);
         }
         // Reap this cluster's processes (escalating to an uncatchable signal if they
-        // ignore the polite one), then sweep the registry. A child that refuses even
-        // the escalated kill surfaces as an error so the caller can keep the state
-        // and retry rather than believe cleanup succeeded and strand a live process.
+        // ignore the polite one). A child that refuses even the escalated kill
+        // surfaces as an error so the caller can keep the state and retry rather
+        // than believe cleanup succeeded and strand a live process.
+        //
+        // NOTE: `terminate()` reaps only this cluster's own pids. It deliberately
+        // does NOT sweep the registry with an empty reference set — doing so would
+        // collect another cluster's still-referenced child. Orphan collection is the
+        // control plane's job, via [`ClusterBackend::reap_orphans`] with the full
+        // reference set.
         self.reap_pids(&pids).await?;
-        // Everything this cluster referred to has just been reaped, so nothing is
-        // referenced any more: sweep the rest (orphaned executors from earlier
-        // scale-downs, and children whose state was already dropped).
-        self.sweep_exited(&[]);
         Ok(())
+    }
+
+    async fn reap_orphans(&self, referenced: &[u32]) -> Result<usize> {
+        Ok(self.sweep_exited(referenced))
+    }
+
+    fn referenced_pids(&self, handle: &ClusterHandle) -> Vec<u32> {
+        let st: LocalState = serde_json::from_value(handle.state.clone()).unwrap_or_default();
+        let mut pids = st.executor_pids;
+        pids.push(st.driver_pid);
+        pids
     }
 }
 
@@ -569,23 +584,6 @@ mod tests {
         assert!(!pid_alive(0), "pid 0 must never report alive");
     }
 
-    // A handle referencing specific pids, so tests can exercise `status()` wiring
-    // without launching a real `forge` cluster.
-    fn handle_for(driver_pid: u32, executor_pids: Vec<u32>) -> crate::ClusterHandle {
-        let st = super::LocalState {
-            driver_pid,
-            driver_port: 0,
-            executor_pids,
-            executor_ports: Vec::new(),
-            work_dir: "/tmp".into(),
-        };
-        crate::ClusterHandle {
-            backend: "local".into(),
-            driver_addr: "127.0.0.1:0".into(),
-            state: serde_json::to_value(st).expect("state"),
-        }
-    }
-
     // Review finding: a driver that has exited but has NOT been reaped yet (a
     // zombie) must read as DEAD. A bare `kill -0` probe says "alive" for a zombie
     // on platforms without `/proc`, which would report a dead cluster as RUNNING —
@@ -639,10 +637,12 @@ mod tests {
     // Review finding: a retained handle whose pid has left cluster state would never
     // be scanned again — leaking a map entry and stranding a zombie. `resize` does
     // exactly that (it drops executor pids from state), and a dead driver's
-    // executors are in the same position. The registry sweep is what collects them.
+    // executors are in the same position. The registry sweep (driven by
+    // `reap_orphans`) is what collects them.
     //
-    // This test covers the sweep mechanism itself; the `status()` wiring around it
-    // is covered by `status_reports_terminated_for_a_driver_reaped_by_another_sweep`.
+    // This test covers the sweep mechanism itself; the control-plane wiring around
+    // it (collecting the complete reference set) is covered by
+    // `reap_orphans_protects_another_clusters_referenced_exit`.
     #[tokio::test]
     async fn sweep_exited_collects_handles_whose_pids_left_cluster_state() {
         let be = backend();
@@ -685,47 +685,61 @@ mod tests {
         }
     }
 
-    // Review finding: a cluster whose driver was reaped by ANOTHER cluster's sweep
-    // must still be told TERMINATED. Without this, `pid_live` finds no handle and
-    // falls through to the best-effort probe, which discards an authoritative exit
-    // (and on non-Unix would report a dead driver as alive).
+    // Round-5 finding (blocking): the sweep must protect the COMPLETE set of
+    // state-referenced pids, not just the caller's own. If cluster A's sweep
+    // collects cluster B's still-referenced exit, B loses its authoritative
+    // answer and falls through to the best-effort probe (which cannot tell a
+    // zombie from a live process, and on non-Unix assumes alive).
+    //
+    // This pins the fix: the control plane passes every cluster's pids to
+    // `reap_orphans`, so A's sweep cannot consume B's referenced exit, and B
+    // still learns of it authoritatively through `pid_live`.
     #[tokio::test]
-    async fn status_reports_terminated_for_a_driver_reaped_by_another_sweep() {
+    async fn reap_orphans_protects_another_clusters_referenced_exit() {
         let be = backend();
 
-        let mut cmd = tokio::process::Command::new("true");
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(false);
-        let child = cmd.spawn().expect("spawn true");
-        let driver_pid = child.id().expect("pid");
-        be.children().insert(driver_pid, child);
+        // Cluster A's driver is long-lived and still referenced; cluster B's
+        // driver exits on its own while B still references it.
+        let driver_a = spawn_tracked(&be, "30").await;
+        let driver_b = spawn_tracked(&be, "0.1").await;
 
-        // Another cluster's `status()` sweep gets there first — it does not refer to
-        // this pid, so it is free to collect it.
+        // The control plane builds the COMPLETE reference set from every
+        // cluster's state: A's driver and B's driver.
+        let complete = vec![driver_a, driver_b];
+
         let deadline = Instant::now() + Duration::from_secs(10);
-        while be.children().get(&driver_pid).is_some() && Instant::now() < deadline {
-            be.sweep_exited(&[]);
-            if be.children().get(&driver_pid).is_some() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut reaped_by_a = 0usize;
+        let mut b_learned_exit = false;
+        while Instant::now() < deadline {
+            // A's `reap_orphans` runs with the complete set. It must never
+            // collect B's (or A's) still-referenced pid.
+            reaped_by_a += be.reap_orphans(&complete).await.expect("reap_orphans");
+            assert!(
+                be.children().get(&driver_b).is_some(),
+                "B's referenced driver must never be collected by A's sweep"
+            );
+            assert!(
+                be.children().get(&driver_a).is_some(),
+                "A's own driver must never be collected by its sweep"
+            );
+            // B consumes its own exit authoritatively.
+            if !be.pid_live(driver_b).expect("pid_live") {
+                b_learned_exit = true;
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            be.children().get(&driver_pid).is_none(),
-            "the other sweep collected the handle"
-        );
-
-        let st = be
-            .status(&handle_for(driver_pid, vec![]))
-            .await
-            .expect("status");
+        assert!(b_learned_exit, "B must authoritatively learn its driver exited");
         assert_eq!(
-            st.state,
-            crate::BackendState::Terminated,
-            "a driver reaped elsewhere must still read TERMINATED, not be guessed at"
+            reaped_by_a, 0,
+            "the complete reference set protects every referenced pid from A's sweep"
         );
-        assert_eq!(st.ready_workers, 0);
+        assert!(
+            be.children().get(&driver_b).is_none(),
+            "B's own liveness query is what reaped and forgot its handle"
+        );
+        // Clean up A's still-live driver.
+        be.reap_pids(&[driver_a]).await.expect("clean up A's driver");
     }
 
     // The recorded exit must take precedence over the platform probe. This is what
