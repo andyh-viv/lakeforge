@@ -62,46 +62,141 @@ impl LocalProcessBackend {
         let child = cmd.spawn().map_err(|e| {
             ClusterError::Launch(format!("spawn {}: {e}", self.forge_bin.display()))
         })?;
-        let pid = child.id().unwrap_or_default();
-        if pid != 0 {
-            // Retain the handle so liveness can be answered with `try_wait`
-            // (which also reaps the child) rather than a zombie-tolerant probe.
-            self.children.lock().unwrap().insert(pid, child);
-        }
+        // Retain the handle so liveness can be answered with `try_wait` (which also
+        // reaps the child) rather than a zombie-tolerant probe.
+        let pid = child.id().ok_or_else(|| {
+            ClusterError::Launch(format!(
+                "spawn {}: child exited before its pid could be recorded",
+                self.forge_bin.display()
+            ))
+        })?;
+        self.children().insert(pid, child);
         Ok(pid)
+    }
+
+    /// The child registry, tolerating a poisoned mutex.
+    ///
+    /// A panic while the lock was held poisons it. The registry is a plain map of
+    /// handles with no cross-entry invariant, so recovering the guard is strictly
+    /// better than panicking the caller — a panic here would take down the control
+    /// plane's cluster monitor loop.
+    fn children(&self) -> std::sync::MutexGuard<'_, HashMap<u32, tokio::process::Child>> {
+        self.children.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Reap every retained child that has already exited, dropping its handle.
+    ///
+    /// A retained handle for an exited child is a zombie nothing else will reap,
+    /// and it keeps the map growing. Sweeping the *whole* registry (rather than
+    /// only the pids currently in a cluster's state) is what collects children
+    /// whose pids have already left state — executors removed by [`Self::resize`],
+    /// and a driver's executors after the driver itself has exited. `try_wait`
+    /// errors are returned rather than swallowed. Returns the number reaped.
+    fn reap_exited(&self) -> Result<usize> {
+        let mut reaped = 0usize;
+        let mut first_err: Option<std::io::Error> = None;
+        let mut done: Vec<u32> = Vec::new();
+        {
+            let mut children = self.children();
+            for (pid, child) in children.iter_mut() {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        done.push(*pid);
+                        reaped += 1;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            for pid in done {
+                children.remove(&pid);
+            }
+        }
+        match first_err {
+            Some(e) => Err(ClusterError::Backend(format!("reaping child processes: {e}"))),
+            None => Ok(reaped),
+        }
+    }
+
+    /// Give pids that are leaving cluster state a bounded chance to exit, then
+    /// reap and forget their handles.
+    ///
+    /// Bounded on purpose: an unresponsive process must not block `resize` or
+    /// `terminate`. Anything still running after the budget keeps its handle and is
+    /// collected later by [`Self::reap_exited`], so no zombie is stranded.
+    async fn reap_pids(&self, pids: &[u32]) {
+        for _ in 0..20 {
+            let mut still_running = false;
+            let mut done: Vec<u32> = Vec::new();
+            {
+                let mut children = self.children();
+                for pid in pids {
+                    if let Some(child) = children.get_mut(pid) {
+                        match child.try_wait() {
+                            Ok(Some(_)) => done.push(*pid),
+                            Ok(None) => still_running = true,
+                            // Do not remove on error: leave it for `reap_exited`,
+                            // which reports errors instead of discarding them.
+                            Err(_) => still_running = true,
+                        }
+                    }
+                }
+                for pid in done {
+                    children.remove(&pid);
+                }
+            }
+            if !still_running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     /// Whether a process this backend spawned is still running.
     ///
-    /// Children we hold are probed with [`tokio::process::Child::try_wait`], which
-    /// *reaps* the child when it has exited: an exited — even not-yet-reaped —
-    /// driver therefore reads as dead, and no zombie is left behind. This is the
-    /// platform-independent answer, and it is the one `status()` uses for the pids
-    /// we spawned.
+    /// For a child we hold this is authoritative *and* it reaps: `try_wait` reports
+    /// an exited process whether or not it has been reaped yet, so a zombie can
+    /// never read as live. If `try_wait` itself fails there is no answer we can
+    /// trust — a probe cannot describe our own child, and falling back to one is
+    /// precisely the zombie-blind behaviour this change removes — so the error is
+    /// returned for the caller to report rather than guessed at.
     ///
-    /// A pid we do not hold (e.g. a work-dir/state record that outlived its
-    /// handle) falls back to [`pid_alive`], which is best-effort: on platforms
-    /// without `/proc` a probe cannot distinguish a zombie from a live process.
+    /// A pid we do **not** hold (a cluster recorded before the control plane
+    /// restarted has state but no handle) is resolved with [`pid_alive`]: exact on
+    /// Linux, best-effort elsewhere. That residual is called out in the change
+    /// proposal and must not be read as a guarantee.
+    ///
     /// A pid of `0` is never live, so `terminate`/`kill` stay reachable.
-    fn pid_live(&self, pid: u32) -> bool {
+    fn pid_live(&self, pid: u32) -> Result<bool> {
         if pid == 0 {
-            return false;
+            return Ok(false);
         }
-        let mut children = self.children.lock().unwrap();
         let mut exited = false;
-        if let Some(child) = children.get_mut(&pid) {
-            match child.try_wait() {
-                Ok(None) => return true,      // still running
-                Ok(Some(_)) => exited = true, // exited; try_wait has now reaped it
-                Err(_) => {}                  // unknown: fall back to the probe
+        let mut child_err: Option<std::io::Error> = None;
+        {
+            let mut children = self.children();
+            if let Some(child) = children.get_mut(&pid) {
+                match child.try_wait() {
+                    Ok(None) => return Ok(true),   // still running
+                    Ok(Some(_)) => exited = true,  // exited; try_wait has reaped it
+                    Err(e) => child_err = Some(e),
+                }
+            }
+            if exited {
+                children.remove(&pid);
             }
         }
-        if exited {
-            children.remove(&pid);
-            return false;
+        if let Some(e) = child_err {
+            return Err(ClusterError::Backend(format!("querying child process {pid}: {e}")));
         }
-        drop(children);
-        pid_alive(pid)
+        if exited {
+            return Ok(false);
+        }
+        Ok(pid_alive(pid))
     }
 
     fn spawn_executor(
@@ -179,15 +274,24 @@ impl ClusterBackend for LocalProcessBackend {
     }
 
     async fn status(&self, handle: &ClusterHandle) -> Result<BackendStatus> {
+        // Sweep first: this keeps the handle registry bounded and collects children
+        // whose pids have already left cluster state (executors removed by
+        // `resize`, and a dead driver's executors).
+        self.reap_exited()?;
         let st: LocalState = serde_json::from_value(handle.state.clone()).unwrap_or_default();
-        if !self.pid_live(st.driver_pid) {
+        if !self.pid_live(st.driver_pid)? {
             return Ok(BackendStatus {
                 state: BackendState::Terminated,
                 message: Some("driver process exited".into()),
                 ready_workers: 0,
             });
         }
-        let ready = st.executor_pids.iter().filter(|p| self.pid_live(**p)).count() as u32;
+        let mut ready = 0u32;
+        for p in &st.executor_pids {
+            if self.pid_live(*p)? {
+                ready += 1;
+            }
+        }
         Ok(BackendStatus { state: BackendState::Running, message: None, ready_workers: ready })
     }
 
@@ -195,12 +299,18 @@ impl ClusterBackend for LocalProcessBackend {
         let mut st: LocalState = serde_json::from_value(handle.state.clone()).unwrap_or_default();
         let target = spec.num_workers as usize;
         let work_dir = PathBuf::from(&st.work_dir);
+        let mut removed: Vec<u32> = Vec::new();
         while st.executor_pids.len() > target {
             if let Some(pid) = st.executor_pids.pop() {
                 kill(pid);
                 st.executor_ports.pop();
+                removed.push(pid);
             }
         }
+        // These pids are leaving cluster state, so nothing else would collect their
+        // handles: reap them here instead of leaking a map entry (and a zombie) per
+        // scale-down.
+        self.reap_pids(&removed).await;
         let mut idx = st.executor_pids.len();
         while st.executor_pids.len() < target {
             let (pid, port) = self.spawn_executor(spec, idx, st.driver_port, &work_dir)?;
@@ -221,31 +331,11 @@ impl ClusterBackend for LocalProcessBackend {
         for pid in &pids {
             kill(*pid);
         }
-        // Give the signalled processes a moment to exit, then reap the handles we
-        // hold so a terminated cluster leaves no zombies behind. Bounded: we never
-        // block termination on an unresponsive process.
-        for _ in 0..20 {
-            let mut alive = false;
-            let mut done: Vec<u32> = Vec::new();
-            {
-                let mut children = self.children.lock().unwrap();
-                for pid in &pids {
-                    if let Some(child) = children.get_mut(pid) {
-                        match child.try_wait() {
-                            Ok(Some(_)) => done.push(*pid),
-                            _ => alive = true,
-                        }
-                    }
-                }
-                for pid in done {
-                    children.remove(&pid);
-                }
-            }
-            if !alive {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        // Reap this cluster's processes, then sweep the registry: a child that exits
+        // after this cluster's handle is cleared (or after the bounded wait) is still
+        // collected, so it cannot linger as a zombie or a stale map entry.
+        self.reap_pids(&pids).await;
+        self.reap_exited()?;
         Ok(())
     }
 }
@@ -400,36 +490,82 @@ mod tests {
     // Review finding: a driver that has exited but has NOT been reaped yet (a
     // zombie) must read as DEAD. A bare `kill -0` probe says "alive" for a zombie
     // on platforms without `/proc`, which would report a dead cluster as RUNNING —
-    // so this test pins the tracked-child behaviour (`try_wait`, which also reaps)
+    // so this test pins the retained-handle behaviour (`try_wait`, which also reaps)
     // rather than the fallback probe.
+    //
+    // The child is `sleep 1` (not a long sleep) so that if an assertion fails the
+    // process is gone within a second rather than lingering; no RAII guard is used
+    // because the handle's owner is the map under test.
     #[tokio::test]
     async fn exited_but_unreaped_tracked_child_reports_dead() {
         let be = backend();
 
         let mut cmd = tokio::process::Command::new("sleep");
-        cmd.arg("0.2")
+        cmd.arg("1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(false);
-        let child = cmd.spawn().expect("spawn sleep 0.2");
+        let child = cmd.spawn().expect("spawn sleep 1");
         let pid = child.id().expect("child pid");
-        be.children.lock().unwrap().insert(pid, child);
+        be.children().insert(pid, child);
 
-        assert!(be.pid_live(pid), "a tracked, still-running child must report alive");
+        assert!(
+            be.pid_live(pid).expect("pid_live"),
+            "a tracked, still-running child must report alive"
+        );
 
-        // `sleep 0.2` exits on its own. We never call wait() ourselves, so only
+        // `sleep 1` exits on its own. We never call wait() ourselves, so only
         // pid_live's `try_wait` can observe the exit and reap the zombie.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while be.pid_live(pid) && Instant::now() < deadline {
+        while be.pid_live(pid).expect("pid_live") && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        assert!(!be.pid_live(pid), "an exited (unreaped) tracked child must report dead");
         assert!(
-            be.children.lock().unwrap().get(&pid).is_none(),
+            !be.pid_live(pid).expect("pid_live"),
+            "an exited (unreaped) tracked child must report dead"
+        );
+        assert!(
+            be.children().get(&pid).is_none(),
             "an exited child must be reaped and dropped from the handle map"
         );
+    }
+
+    // Review finding: a retained handle whose pid has left cluster state would never
+    // be scanned again — leaking a map entry and stranding a zombie. `resize` does
+    // exactly that (it drops executor pids from state), and a dead driver's
+    // executors are in the same position. `reap_exited` sweeps the whole registry,
+    // which is what must collect them.
+    #[tokio::test]
+    async fn reap_exited_collects_handles_whose_pids_left_cluster_state() {
+        let be = backend();
+        for _ in 0..3 {
+            let mut cmd = tokio::process::Command::new("sleep");
+            cmd.arg("0.3")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(false);
+            let child = cmd.spawn().expect("spawn sleep 0.3");
+            let pid = child.id().expect("pid");
+            be.children().insert(pid, child);
+        }
+        assert_eq!(be.children().len(), 3, "three handles retained");
+
+        // No pid is probed through any cluster state here, so only the registry
+        // sweep can collect them.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut reaped = 0usize;
+        while Instant::now() < deadline {
+            reaped += be.reap_exited().expect("reap_exited");
+            if reaped >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(reaped >= 3, "the sweep must reap every exited child, got {reaped}");
+        assert!(be.children().is_empty(), "no handle may be retained after reaping");
     }
 
     // The pid-0 invariant keeps `terminate`/`kill` reachable for a cluster record
@@ -437,7 +573,7 @@ mod tests {
     #[tokio::test]
     async fn pid_zero_is_never_live() {
         let be = backend();
-        assert!(!be.pid_live(0), "pid 0 must never be live via pid_live");
+        assert!(!be.pid_live(0).expect("pid_live"), "pid 0 must never be live via pid_live");
         assert!(!pid_alive(0), "pid 0 must never be live via pid_alive");
     }
 }
