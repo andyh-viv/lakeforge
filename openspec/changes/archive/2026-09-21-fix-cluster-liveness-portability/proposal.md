@@ -46,22 +46,27 @@ Consequences on macOS (`main` @ 993cbd7):
    stranded.** A retained handle for an exited child is a zombie nothing else will
    reap, and it grows the map. The backend exposes `reap_orphans(referenced)`,
    which sweeps the whole registry, and `monitor_clusters` calls it once per tick
-   with the COMPLETE set of pids referenced by every cluster's state. `status()`
-   and `terminate()` deliberately do NOT sweep — a single cluster cannot see the
-   other clusters' state, so sweeping there could only use an incomplete set and
-   collect another cluster's still-referenced exit. The sweep collects children
+   with the set of pids referenced by every cluster's state it fetched that tick.
+   `status()` and `terminate()` deliberately do NOT sweep — a single cluster cannot
+   see the other clusters' state, so sweeping there could only use an incomplete set
+   and collect another cluster's still-referenced exit. The sweep collects children
    whose pids have left cluster state: executors removed by `resize()` and a dead
-   driver's executors. A failing `try_wait` during a sweep is logged with its pid
-   and isolated to that child — it is not returned as an error, because the sweep
-   runs once per tick and one unqueryable child must not stop reconciliation for
-   every other cluster. A sweep never collects a pid in the complete reference set:
-   the owner consumes that exit through its own liveness query, so the
-   authoritative answer is never handed to the best-effort probe, and the
-   guarantee does not depend on any retention window or capacity. `resize()` reaps
-   the executors it removes directly, and `terminate()` reaps its own pids.
-   `reap_pids()` escalates from the polite signal to an uncatchable one and returns
-   an error if a process survives both, so a cluster handle is never cleared while
-   a live process remains. Sweeps are bounded and never block on an unresponsive
+   driver's executors; an exited child whose pid a cluster's state still references
+   is deliberately retained, and the owner consumes that exit on its next liveness
+   query. A failing `try_wait` during a sweep is logged with its pid and isolated to
+   that child — it is not returned as an error, because the sweep runs once per tick
+   and one unqueryable child must not stop reconciliation for every other cluster. A
+   sweep never collects a pid in the reference set: the owner consumes that exit
+   through its own liveness query, so a pid whose handle is still retained is never
+   handed to the best-effort probe (only an untracked pid — state recorded before a
+   control-plane restart — reaches that probe), and the guarantee does not depend on
+   any retention window or capacity. `resize()` reaps the executors it removes
+   directly, and `terminate()` reaps its own pids, including untracked ones: a pid
+   it does not hold a handle for is probed, force-killed with a direct SIGKILL if
+   still alive, and reported as an error if it still cannot be confirmed gone, so a
+   cluster handle is never cleared while a live process remains — for a tracked
+   child that confirmation is the authoritative handle, for an untracked pid it is
+   the best-effort probe. Sweeps are bounded and never block on an unresponsive
    process. The registry lock tolerates poisoning (a panic while held would
    otherwise take down the API's cluster monitor loop).
 4. **Cleanup failure is retryable across the API layer** in
@@ -81,9 +86,11 @@ Consequences on macOS (`main` @ 993cbd7):
    deleting the record (the last reference), while a cluster that is already gone
    stays an idempotent success. `monitor_clusters` retries a `Terminating`
    cluster, so the "a later reconcile retries" claim is true rather than
-   aspirational. The injected-failure path is not unit-tested (it needs the
-   LF-025 integration harness) and is recorded as a residual below; the
-   control-flow paths are covered by mock-backend unit tests.
+   aspirational, and the retry preserves the reason that initiated the
+   termination — read back from `termination_reason` (e.g. `DRIVER_UNREACHABLE`)
+   rather than overwritten with `USER_REQUEST`. The cleanup-failure-then-retry
+   path is unit-tested with a fail-once mock backend, not just the LF-025
+   integration harness.
 5. **Regression tests** in `local.rs`'s `#[cfg(test)] mod tests`:
    - `pid_alive_tracks_liveness_portably` — a live child reports alive, a killed
      *and reaped* child reports dead, pid `0` reports dead. Does not touch
@@ -97,10 +104,9 @@ Consequences on macOS (`main` @ 993cbd7):
      must still read dead afterwards. This is the second review finding (the
      `resize` leak); verified to fail when the sweep is removed.
    - `reap_orphans_protects_another_clusters_referenced_exit` — a two-cluster
-     regression: cluster A's sweep (with the complete reference set) cannot collect
-     cluster B's still-referenced exit, and B still learns of it authoritatively.
-     Replaces the round-3 `status_reports_terminated_for_a_driver_reaped_by_another_sweep`,
-     which asserted the defective caller-pids-only behaviour.
+     regression: cluster A's sweep (with the reference set the control plane
+     collected) cannot collect cluster B's still-referenced exit, and B still
+     learns of it authoritatively.
    - `sweep_exited_retains_pids_its_cluster_still_references` — a sweep never
      collects a pid its cluster's state still references; the owner consumes the
      exit itself. Verified to fail when the ownership guard is removed.
@@ -111,6 +117,12 @@ Consequences on macOS (`main` @ 993cbd7):
      ignores SIGTERM is force-killed rather than left running; the child signals
      readiness first so the test cannot pass for the wrong reason, and it is
      verified to fail when the escalation is removed.
+   - `terminate_never_reports_success_for_an_untracked_alive_pid` — a
+     SIGTERM-ignoring child spawned with plain `std::process::Command` (so it is
+     NOT tracked) must be probed, force-killed, and reported as an error if it
+     still cannot be confirmed gone; `terminate()` must never return `Ok` while it
+     is alive. Verified to fail when the untracked pid is skipped (the restart
+     regression).
    - `pid_zero_is_never_live` — the pid-0 invariant holds through both paths.
 
 API-layer regression tests in `clusters.rs` (scripted mock backend):
@@ -122,6 +134,9 @@ API-layer regression tests in `clusters.rs` (scripted mock backend):
    - `monitor_driver_loss_cleans_up_before_clearing_the_handle` — driver loss runs
      cleanup before clearing the handle; a failed cleanup keeps the handle and
      persists a retryable `Terminating` state.
+   - `retried_driver_loss_cleanup_preserves_the_reason` — a driver-loss cleanup
+     that fails once and succeeds on the retry is still recorded as
+     `DRIVER_UNREACHABLE`, not `USER_REQUEST`.
 
 The required cases hold on Linux **and** macOS: (a) a live process → alive;
 (b) an exited process → dead whether or not it has been reaped; (c) pid `0` →
@@ -164,14 +179,16 @@ dead.
   `permanent_delete` propagates the failure instead of deleting the record (a
   missing cluster stays an idempotent success), and `monitor_clusters` retries a
   `Terminating` cluster and runs cleanup before clearing the handle on driver
-  loss. The startup-timeout path clears the handle only after successful cleanup.
+  loss. A retry preserves the reason that initiated the termination (e.g.
+  `DRIVER_UNREACHABLE`) rather than overwriting it with `USER_REQUEST`. The
+  startup-timeout path clears the handle only after successful cleanup.
 - **Code**: `crates/lakeforge-cluster-manager/src/local.rs` and
   `crates/lakeforge-api/src/api/clusters.rs`.
 - **Specs**: new `cluster-lifecycle` capability spec, delta in
   `specs/cluster-lifecycle/spec.md` here.
 - **Docs**: `docs/issues.md` (LF-029 entry, Wave 0 index row); `docs/handoff.md`
   (UC/Lakebase smoke recorded as 49/1, not 50/50).
-- **Tests**: `cargo test -p lakeforge-cluster-manager` (8 tests:
+- **Tests**: `cargo test -p lakeforge-cluster-manager` (9 tests:
   `pid_alive_tracks_liveness_portably`,
   `exited_but_unreaped_tracked_child_reports_dead`,
   `sweep_exited_collects_handles_whose_pids_left_cluster_state`,
@@ -179,23 +196,27 @@ dead.
   `sweep_exited_retains_pids_its_cluster_still_references`,
   `sweep_exited_collects_many_unreferenced_handles_in_one_pass`,
   `reap_pids_force_kills_a_child_that_ignores_the_polite_signal`,
-  `pid_zero_is_never_live`), plus 3 API-layer tests in `clusters.rs`. The
-  API-layer injected-failure path is not unit-tested and is recorded as a
-  residual depending on the LF-025 integration harness.
+  `terminate_never_reports_success_for_an_untracked_alive_pid`,
+  `pid_zero_is_never_live`), plus 4 API-layer tests in `clusters.rs` (the
+  cleanup-failure-then-retry path included, via a fail-once mock backend).
 
 ## Traceability
 
 - Issue: `docs/issues.md` → **LF-029**.
 - Branch: `fix/lf-029-cluster-liveness`; commits prefixed `LF-029: …`.
 - Review: independent reviews on PR #3 — `gpt-5.6-luna` (rounds 1–2) and
-  `gpt-5.6-sol` (rounds 3–5). Round 1: zombie handling, pid-0 on non-Unix.
+  `gpt-5.6-sol` (rounds 3–6). Round 1: zombie handling, pid-0 on non-Unix.
   Round 2: swallowed `try_wait` error, `resize` handle leak, unswept executor
   handles. Round 3: sweep-failure isolation, recorded-exit precedence, force-kill
   escalation. Round 4: the recorded-exit guarantee was capacity-dependent, and
   cleanup failure was not safely retryable across the API. Round 5: the sweep
-  protected only the calling cluster's pids (not the complete reference set), the
-  startup-timeout path ignored cleanup failure, and driver death cleared the
-  handle while executors were still alive. All rounds are addressed here.
+  protected only the calling cluster's pids (not the reference set collected from
+  every cluster), the startup-timeout path ignored cleanup failure, and driver
+  death cleared the handle while executors were still alive. Round 6 (final):
+  `terminate()` reported success for an untracked-but-alive pid after a restart,
+  a retried driver-loss cleanup lost the DRIVER_UNREACHABLE classification, and
+  the artifacts overclaimed the sweep/retention/cleanup guarantees. All rounds are
+  addressed here.
 
 ## Risks
 

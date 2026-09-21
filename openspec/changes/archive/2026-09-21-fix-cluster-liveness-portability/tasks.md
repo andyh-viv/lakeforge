@@ -43,13 +43,15 @@ Tick items as they land. `[x]` = on branch
 
 - [x] 2b.1 Stop falling back to a probe when `try_wait` errors: `pid_live` now
       returns `Result<bool>` and reports the failure instead of guessing
-- [x] 2b.2 Add `sweep_exited()`, a registry-wide sweep called from `status()` and
-      `terminate()`, so handles whose pids left cluster state are collected
+- [x] 2b.2 Add `sweep_exited()`, a registry-wide sweep (driven by the control
+      plane via `reap_orphans` since round 5, 2e.1), so handles whose pids left
+      cluster state are collected
 - [x] 2b.3 `resize()` reaps the executors it removes instead of leaking a handle
       (and a zombie) per scale-down
-- [x] 2b.4 `terminate()` reaps its own pids (bounded) then sweeps the registry, so
+- [x] 2b.4 `terminate()` reaps its own pids (bounded); the registry sweep moved
+      off `terminate()` to the control-plane `reap_orphans` in round 5 (2e.1), so
       orphaned executors from earlier scale-downs and children whose state was
-      already dropped are still collected
+      already dropped are still collected there
 - [x] 2b.5 Tolerate a poisoned registry mutex instead of panicking the monitor loop
 - [x] 2b.6 `spawn()` returns a launch error if the child has no pid, instead of
       storing pid `0`
@@ -63,19 +65,22 @@ Tick items as they land. `[x]` = on branch
 
 - [x] 2c.1 Isolate sweep failures per child: `sweep_exited()` logs each failing
       pid and never returns an error, so one unqueryable child cannot stop
-      reconciliation for every other cluster (`status()` runs per cluster); a
-      cluster that owns such a child still gets the error from `pid_live`
+      reconciliation for every other cluster (the sweep runs once per tick via
+      `reap_orphans`); a cluster that owns such a child still gets the error from
+      `pid_live`
 - [x] 2c.2 Preserve the authoritative answer across the sweep: pids observed
       exiting are kept in a bounded ring, and `pid_live` consults it rather than
       falling through to the probe when the handle is already gone
-- [x] 2c.3 `status()` queries its own pids before sweeping, and queries executors
-      even when the driver is already dead, so their exits are reaped too
+- [x] 2c.3 `status()` queries only its own pids (the sweep moved off `status()`
+      to the control-plane `reap_orphans` in round 5, 2e.1), and queries
+      executors even when the driver is already dead, so their exits are reaped
+      too
 - [x] 2c.4 Escalate cleanup: `reap_pids()` force-kills a child that survives the
       polite signal and returns an error rather than reporting a false success, so
       a cluster handle is not cleared while a live process remains
-- [x] 2c.5 Regression test `status_reports_terminated_for_a_driver_reaped_by_another_sweep`
-      (the `status()` wiring, not just the sweep mechanism) — replaced in round 5
-      (2e.2) because it asserted the defective caller-pids-only sweep
+- [x] 2c.5 Regression test for the `status()` wiring (not just the sweep
+      mechanism) — replaced in round 5 (2e.2) because it asserted the defective
+      caller-pids-only sweep
 - [x] 2c.6 Regression test `recorded_exit_takes_precedence_over_the_probe` —
       verified to FAIL when the precedence is removed
 - [x] 2c.7 Regression test `reap_pids_force_kills_a_child_that_ignores_the_polite_signal`,
@@ -114,13 +119,13 @@ Tick items as they land. `[x]` = on branch
 
 ## 2e. Review remediation, round 5 (gpt-5.6-sol, same reviewer after round-4 fixes)
 
-- [x] 2e.1 The sweep protects the COMPLETE set of state-referenced pids supplied
-      by the control plane, not the calling cluster's own pids: `status()` no
-      longer sweeps, `terminate()` no longer sweeps with an empty set, and
-      `monitor_clusters` collects every cluster's pids (via `referenced_pids`) and
-      calls `reap_orphans` once per tick
-- [x] 2e.2 Replaced `status_reports_terminated_for_a_driver_reaped_by_another_sweep`
-      (which asserted the defective behaviour) with the two-cluster regression
+- [x] 2e.1 The sweep protects the reference set of state-referenced pids supplied
+      by the control plane (collected from every cluster), not the calling
+      cluster's own pids: `status()` no longer sweeps, `terminate()` no longer
+      sweeps with an empty set, and `monitor_clusters` collects every cluster's
+      pids (via `referenced_pids`) and calls `reap_orphans` once per tick
+- [x] 2e.2 Replaced the round-3 caller-pids-only `status()` regression (which
+      asserted the defective behaviour) with the two-cluster regression
       `reap_orphans_protects_another_clusters_referenced_exit`
 - [x] 2e.3 The startup-timeout path clears the handle only after successful
       cleanup and persists a retryable `Terminating` state (with the handle and a
@@ -135,6 +140,26 @@ Tick items as they land. `[x]` = on branch
       `start_cluster_refuses_any_inactive_cluster_holding_a_handle`, and
       `monitor_driver_loss_cleans_up_before_clearing_the_handle`
 
+## 2f. Review remediation, round 6 (gpt-5.6-sol, final round)
+
+- [x] 2f.1 `terminate()` no longer reports success for an untracked-but-alive pid
+      (state recorded before a control-plane restart): `reap_round` probes a pid it
+      does not hold a handle for, `force_kill` escalates it with a direct
+      `kill -KILL`, and cleanup returns an error if the pid still cannot be
+      confirmed gone
+- [x] 2f.2 Regression test `terminate_never_reports_success_for_an_untracked_alive_pid`
+      — verified to FAIL when the untracked pid is skipped (mutation check)
+- [x] 2f.3 Preserve the initiating termination reason across `Terminating` retries:
+      the monitor's driver-loss path persists `DRIVER_UNREACHABLE` on a failed
+      cleanup, and `terminate_cluster` reads it back on a retry instead of
+      overwriting it with `USER_REQUEST`
+- [x] 2f.4 Regression test `retried_driver_loss_cleanup_preserves_the_reason`
+      (fail-once mock backend)
+- [x] 2f.5 Correct the artifact overclaims and stale statements in the live spec,
+      the archived change, and `docs/issues.md` (retained referenced exits, the
+      fetched reference-set snapshot, the untracked-pid probe fallback, the
+      removal of the per-`status()` sweep, and the provenance fix)
+
 ## 3. Docs and spec
 
 - [x] 3.1 Add LF-029 to `docs/issues.md` section F (after LF-028) with
@@ -147,7 +172,7 @@ Tick items as they land. `[x]` = on branch
 
 ## 4. Verification
 
-- [x] 4.1 `cargo test -p lakeforge-cluster-manager` passes (8 tests)
+- [x] 4.1 `cargo test -p lakeforge-cluster-manager` passes (9 tests)
 - [x] 4.2 `cargo clippy --workspace --all-targets -- -D warnings` is clean
 - [x] 4.3 `openspec validate --changes` passes for this change
 - [x] 4.4 `tests/smoke/platform-smoke.sh` reaches `passed=39 failed=0` on macOS

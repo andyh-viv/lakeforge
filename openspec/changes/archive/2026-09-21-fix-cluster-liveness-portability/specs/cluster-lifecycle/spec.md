@@ -43,12 +43,14 @@ assumes a non-zero pid is alive. (LF-029)
 
 ### Requirement: Retained child handles are never leaked or stranded
 
-The backend SHALL NOT retain the handle of a child process that has already
-exited: every sweep SHALL reap exited children and drop their handles, including
-children whose pids no longer appear in any cluster's state (executors removed by
-`resize`, and a dead driver's executors). Reaping SHALL be bounded, and a process
-that survives the polite signal SHALL be force-killed, so an unresponsive process
-cannot block or silently outlive `resize` or `terminate`. (LF-029)
+The backend SHALL NOT strand a child handle: a sweep SHALL reap exited children
+whose pids no longer appear in any cluster's state (executors removed by
+`resize`, and a dead driver's executors) and drop their handles. An exited child
+whose pid a cluster's state STILL references is deliberately retained — its owner
+consumes the exit on its next liveness query, so a referenced exit is never
+collected by a sweep. Reaping SHALL be bounded, and a process that survives the
+polite signal SHALL be force-killed, so an unresponsive process cannot block or
+silently outlive `resize` or `terminate`. (LF-029)
 
 #### Scenario: An exited child whose pid left cluster state is still collected
 - **GIVEN** a retained handle for a child that has exited and whose pid appears in
@@ -65,25 +67,28 @@ cannot block or silently outlive `resize` or `terminate`. (LF-029)
 
 ### Requirement: The registry sweep protects the complete set of state-referenced pids
 
-The registry sweep SHALL be driven by the control plane, which collects the
-COMPLETE set of pids referenced by every cluster's state in the workspace and
-passes it to the backend (`reap_orphans`) once per reconcile tick. A sweep SHALL
-NOT collect (reap and forget) any child whose pid is in that set; such a pid
-SHALL be consumed by its owner through the owner's own liveness query, which reaps
-it and reports the authoritative exit. Because the set is complete, no cluster's
-sweep can ever consume another cluster's still-referenced exit. The backend's
-per-cluster `status()` SHALL NOT sweep the registry — it cannot see the other
-clusters' state, so sweeping from there could only use an incomplete set. The
-guarantee SHALL NOT depend on a retention window or on how many children exited at
-once: a referenced pid is never evicted, and a pid that no cluster's state
-references SHALL be collected, however many such pids there are. The backend SHALL
-NOT hand a pid it spawned to the best-effort platform probe, which cannot
-distinguish a zombie from a live process and, on non-Unix targets, assumes a
-non-zero pid is alive. (LF-029)
+The registry sweep SHALL be driven by the control plane, which collects the set of
+pids referenced by every cluster's state it fetched in that reconcile tick and
+passes it to the backend (`reap_orphans`) once per tick. A sweep SHALL NOT collect
+(reap and forget) any child whose pid is in that set; such a pid SHALL be consumed
+by its owner through the owner's own liveness query, which reaps it and reports the
+authoritative exit. Because the set is built from the clusters the control plane
+fetched, no cluster's sweep can consume another cluster's still-referenced exit
+within that snapshot. The backend's per-cluster `status()` SHALL NOT sweep the
+registry — it cannot see the other clusters' state, so sweeping from there could
+only use an incomplete set. The guarantee SHALL NOT depend on a retention window or
+on how many children exited at once: a referenced pid is never evicted, and a pid
+that no cluster's state references SHALL be collected, however many such pids there
+are. A pid whose handle the backend still retains is NOT handed to the best-effort
+platform probe, which cannot distinguish a zombie from a live process and, on
+non-Unix targets, assumes a non-zero pid is alive; only a pid the backend does not
+hold (state recorded before a control-plane restart) falls through to that probe.
+(LF-029)
 
 #### Scenario: A sweep does not collect a pid another cluster still references
 - **GIVEN** two clusters, one of whose children has exited while its state still
-  references its pid, and the control plane supplies the complete reference set
+  references its pid, and the control plane supplies the reference set it
+  collected (including this pid)
 - **WHEN** the control plane's sweep runs
 - **THEN** the exited child is NOT collected, and the owning cluster's next
   liveness query still reports the authoritative exit and reaps it
