@@ -320,7 +320,22 @@ impl AppState {
             return Ok(());
         }
         // A cluster left in `Terminating` by a previous attempt whose cleanup did
-        // not finish is retried here instead of being reported as done.
+        // not finish is retried here instead of being reported as done. A retry
+        // must preserve the reason that initiated the termination (persisted in
+        // `termination_reason`, e.g. DRIVER_UNREACHABLE from the monitor's
+        // driver-loss path) rather than the generic caller-supplied default, so
+        // the failure classification survives across reconcile ticks.
+        let retrying = c.state == ClusterState::Terminating;
+        let reason_code: String = if retrying {
+            c.termination_reason
+                .as_ref()
+                .and_then(|v| v.get("code"))
+                .and_then(|code| code.as_str())
+                .unwrap_or(reason)
+                .to_string()
+        } else {
+            reason.to_string()
+        };
         c.state = ClusterState::Terminating;
         self.save_cluster(&c).await?;
         if let Some(h) = &c.handle {
@@ -339,10 +354,15 @@ impl AppState {
         c.state = ClusterState::Terminated;
         c.terminated_time = now_ms();
         c.state_message = String::new();
-        c.termination_reason = Some(json!({ "code": reason, "type": if reason == "USER_REQUEST" { "SUCCESS" } else { "CLIENT_ERROR" } }));
+        // On a retry, keep the persisted reason (including its `type`) rather than
+        // overwriting it with the caller's default; on a fresh termination, record
+        // the caller's reason.
+        if !(retrying && c.termination_reason.is_some()) {
+            c.termination_reason = Some(json!({ "code": reason_code, "type": if reason_code == "USER_REQUEST" { "SUCCESS" } else { "CLIENT_ERROR" } }));
+        }
         c.handle = None;
         self.save_cluster(&c).await?;
-        self.cluster_event(id, "TERMINATING", json!({ "reason": { "code": reason } })).await?;
+        self.cluster_event(id, "TERMINATING", json!({ "reason": { "code": reason_code } })).await?;
         Ok(())
     }
 
@@ -434,6 +454,10 @@ impl AppState {
                             c.state = ClusterState::Terminating;
                             c.state_message = format!("cleanup incomplete: {e}");
                             c.last_state_loss_time = now_ms();
+                            // Persist the reason that initiated this cleanup, so a
+                            // later retry preserves DRIVER_UNREACHABLE rather than
+                            // falling back to the generic USER_REQUEST.
+                            c.termination_reason = Some(json!({ "code": "DRIVER_UNREACHABLE", "type": "SERVICE_FAULT" }));
                             self.save_cluster(&c).await?;
                         }
                     }
@@ -816,6 +840,7 @@ mod tests {
     use async_trait::async_trait;
     use clap::Parser;
     use lakeforge_cluster_manager::{BackendStatus, ClusterBackend, ClusterError, ClusterHandle, LaunchSpec};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     /// A backend whose `status`/`terminate`/`launch` behaviour is scripted, so the
@@ -824,6 +849,11 @@ mod tests {
         status: BackendState,
         terminate_err: Option<String>,
         launch_err: Option<String>,
+        /// Fail the first `fail_first_terminate` `terminate` calls, then succeed
+        /// (or honour `terminate_err`). Used to exercise a cleanup that fails
+        /// once and succeeds on a later retry.
+        fail_first_terminate: usize,
+        terminate_calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -844,6 +874,10 @@ mod tests {
             Ok(handle.clone())
         }
         async fn terminate(&self, _handle: &ClusterHandle) -> lakeforge_cluster_manager::Result<()> {
+            let call = self.terminate_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.fail_first_terminate {
+                return Err(ClusterError::Backend("terminate failed (simulated)".into()));
+            }
             match &self.terminate_err {
                 Some(e) => Err(ClusterError::Backend(e.clone())),
                 None => Ok(()),
@@ -852,11 +886,15 @@ mod tests {
     }
 
     fn mock(status: BackendState) -> Arc<dyn ClusterBackend> {
-        Arc::new(MockBackend { status, terminate_err: None, launch_err: None })
+        Arc::new(MockBackend { status, terminate_err: None, launch_err: None, fail_first_terminate: 0, terminate_calls: AtomicUsize::new(0) })
     }
 
     fn mock_failing_terminate(status: BackendState) -> Arc<dyn ClusterBackend> {
-        Arc::new(MockBackend { status, terminate_err: Some("terminate failed".into()), launch_err: None })
+        Arc::new(MockBackend { status, terminate_err: Some("terminate failed".into()), launch_err: None, fail_first_terminate: 0, terminate_calls: AtomicUsize::new(0) })
+    }
+
+    fn mock_fail_terminate_once(status: BackendState) -> Arc<dyn ClusterBackend> {
+        Arc::new(MockBackend { status, terminate_err: None, launch_err: None, fail_first_terminate: 1, terminate_calls: AtomicUsize::new(0) })
     }
 
     async fn test_state(backend: Arc<dyn ClusterBackend>) -> Arc<AppState> {
@@ -979,5 +1017,42 @@ mod tests {
         assert_eq!(after.state, ClusterState::Terminating, "failed driver-loss cleanup must persist a retryable state");
         assert!(after.handle.is_some(), "the handle must be retained while executors may still be alive");
         assert!(after.state_message.contains("cleanup incomplete"));
+    }
+
+    // Final-round finding (blocking): a driver-loss termination that fails once and
+    // succeeds on a later retry must still be recorded as DRIVER_UNREACHABLE, not
+    // USER_REQUEST. The monitor used to retry a `Terminating` cluster with a
+    // hardcoded USER_REQUEST, overwriting the failure classification. This pins the
+    // provenance fix: the monitor persists the initiating reason on failure and the
+    // retry reuses it.
+    #[tokio::test]
+    async fn retried_driver_loss_cleanup_preserves_the_reason() {
+        let st = test_state(mock_fail_terminate_once(BackendState::Terminated)).await;
+        let c = test_cluster(ClusterState::Running, Some(test_handle()));
+        insert_cluster(&st, &c).await;
+
+        // First tick: driver loss detected, cleanup fails -> Terminating + handle
+        // retained + DRIVER_UNREACHABLE persisted.
+        st.monitor_clusters().await.expect("monitor");
+        let after = st.get_cluster("c-1").await.expect("get").data;
+        assert_eq!(after.state, ClusterState::Terminating, "failed driver-loss cleanup must persist Terminating");
+        assert!(after.handle.is_some(), "the handle must be retained");
+        assert_eq!(
+            after.termination_reason.as_ref().and_then(|v| v.get("code")).and_then(|c| c.as_str()),
+            Some("DRIVER_UNREACHABLE"),
+            "the initiating reason must be persisted on the failed cleanup"
+        );
+
+        // Second tick: the Terminating cluster is retried; cleanup now succeeds and
+        // must still be recorded as DRIVER_UNREACHABLE, not USER_REQUEST.
+        st.monitor_clusters().await.expect("monitor");
+        let after = st.get_cluster("c-1").await.expect("get").data;
+        assert_eq!(after.state, ClusterState::Terminated, "the retried cleanup succeeds");
+        assert!(after.handle.is_none(), "the handle is cleared after successful cleanup");
+        assert_eq!(
+            after.termination_reason.as_ref().and_then(|v| v.get("code")).and_then(|c| c.as_str()),
+            Some("DRIVER_UNREACHABLE"),
+            "the retried cleanup must preserve DRIVER_UNREACHABLE, not USER_REQUEST"
+        );
     }
 }
