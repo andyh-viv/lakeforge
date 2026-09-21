@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Python SDK, dbutils and CLI for the Lakeforge platform (Databricks-compatible REST API)."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "Apache-2.0" }
+license = { file = "LICENSE" }
 dependencies = []
 
 [project.optional-dependencies]
