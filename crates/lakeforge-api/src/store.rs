@@ -288,6 +288,19 @@ impl Store {
         Ok(n > 0)
     }
 
+    /// Delete the `n` oldest docs of a kind (log-style eviction).
+    pub async fn delete_oldest(&self, kind: &str, workspace_id: &str, n: u64) -> ApiResult<u64> {
+        Ok(sqlx::query(
+            "DELETE FROM docs WHERE id IN (SELECT id FROM docs WHERE kind = $1 AND workspace_id = $2 ORDER BY created_at ASC, id ASC LIMIT $3)",
+        )
+        .bind(kind)
+        .bind(workspace_id)
+        .bind(n as i64)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
     pub async fn delete_children(&self, kind: &str, parent_id: &str) -> ApiResult<u64> {
         Ok(sqlx::query("DELETE FROM docs WHERE kind = $1 AND parent_id = $2")
             .bind(kind)

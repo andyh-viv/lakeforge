@@ -110,6 +110,48 @@ notebook kernels.
   selector and extra env (`LAKEFORGE_FORGE_*`) so cloud workload identity
   reaches the compute pods.
 
+### Governance layer — `uc/`
+
+Unity Catalog semantics live in `crates/lakeforge-api/src/uc/` and are
+enforced at two choke points:
+
+1. **REST**: every `api/catalog.rs` / `api/catalog_ext.rs` handler builds an
+   `Authorizer` (`uc/privileges.rs`) and calls `require(securable, name,
+   privilege)`, which walks metastore → catalog → schema → object grants,
+   ownership and `ALL_PRIVILEGES`.
+2. **SQL**: `AppState::execute_sql` (`api/sql.rs`) is the *only* path from any
+   surface (Statement API, notebook `spark.sql`/`%sql`, jobs, pipelines, SQL
+   editor) to a Forge driver. It calls `prepare_sql` (`uc/sqlauth.rs`), which
+   analyses the statement (`uc/sqlguard.rs`, `sqlparser` + text fallback),
+   authorises reads/writes/DDL/paths/system tables, rewrites row filters,
+   column masks, SQL UDF bodies and session functions into the text, and
+   either executes metastore-only statements (`GRANT`/`REVOKE`/`SHOW GRANTS`/
+   `ALTER … OWNER TO` via `uc/grant_sql.rs`, `CREATE/DROP FUNCTION`) directly or
+   hands the rewritten SQL to Forge. Afterwards it records query history, an
+   audit event, mirrors engine DDL into UC (`observe_ddl`) and writes table /
+   column lineage (`uc/lineage.rs`).
+
+```
+client ──► execute_sql ──► prepare_sql ──► authorize ──► rewrite ──┬─► MetastoreOp (grants, UDF DDL)
+                                                                   └─► Forge driver (gRPC) ──► Delta
+                      ◄── history / audit / observe_ddl / lineage ◄────────────────────────────┘
+```
+
+`uc/audit.rs` also mounts an axum middleware that records every mutating REST
+call; `uc/system_tables.rs` turns control-plane documents into the
+`system.*` / `information_schema.*` tables, materialised as Delta tables under
+the warehouse on demand so Forge can query them like any other table.
+
+### Lakebase — `api/lakebase.rs`
+
+Databricks-shaped `/api/2.0/database/*` control plane (instances, roles,
+credentials, database catalogs, synced tables). Two backends selected by
+config: `emulated` (default; metadata only, lifecycle states simulated, no
+PostgreSQL endpoint) and `external` (`LAKEFORGE_LAKEBASE_POSTGRES_URL`;
+reports the configured host but does not yet provision roles/databases or
+sync data). Database catalogs are registered in UC as catalogs of type
+`DATABASE_CATALOG`. See [uc-lakebase-status.md](uc-lakebase-status.md).
+
 ## Workspace UI — `web/`
 
 React 19 + Vite + TypeScript, served from `web/dist` by the API with SPA
