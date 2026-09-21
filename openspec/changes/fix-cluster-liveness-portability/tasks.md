@@ -31,4 +31,4 @@ Tick items as they land. `[x]` = on branch
 
 - [x] 3.1 `cargo test -p lakeforge-cluster-manager` passes
 - [x] 3.2 `cargo clippy --workspace --all-targets -- -D warnings` is clean
-- [ ] 3.3 Commit in small `LF-029: …` commits ending `(refs #LF-029)`; no push
+- [x] 3.3 Commit in small `LF-029: …` commits ending `(refs #LF-029)`; no push
