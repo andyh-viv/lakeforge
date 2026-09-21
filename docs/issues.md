@@ -777,7 +777,8 @@ Conventions for every issue:
   routes from `api/*.rs` and diffs against `docs/api-surface.md`, (b) checks
   every `LF-###` in `docs/issues.md` is referenced by an OpenSpec task or
   marked done; run it in CI (warn-only first).
-- **Proposed implementation**: bash + `rg`; keep it dependency-free.
+- **Proposed implementation**: dependency-free bash + coreutils (awk, sed,
+  grep, sort, comm); no `rg`, no GNU-only flags, portable across bash 3.2/5.
 - **Dependencies**: none.
 - **Acceptance criteria**: script passes on this branch; CI shows the job.
 - **Focused tests**: the script itself.

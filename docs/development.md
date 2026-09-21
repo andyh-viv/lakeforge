@@ -166,25 +166,58 @@ open issue (see [issues.md](issues.md) #24).
 
 ### Docs drift checker
 
-`scripts/check-docs.sh` keeps the two most drift-prone documents honest:
+`scripts/check-docs.sh` keeps the two most drift-prone documents honest. It is a
+**dependency-free bash + coreutils** script (awk/sed/grep/sort/comm) that runs on
+both bash 3.2 (macOS) and bash 5 (Linux CI).
 
-- **Routes**: every path registered with `.route("…")` under
-  `crates/lakeforge-api/src/api/*.rs` (plus `lib.rs`/`api/mod.rs`) is compared with
-  the backticked paths in `docs/api-surface.md`. Documented shorthand is expanded
-  before comparison — `{create,list,delete}` alternation and `[/{id}]` optionals —
-  so a family entry covers its real routes. A documented entry that is a strict
-  prefix of a registered route is reported separately as namespace/family
-  notation rather than as drift. Path parameters are compared as `{name}` and
-  `:name` equivalently, and trailing slashes are ignored.
-- **Issue references**: every `LF-###` defined in `docs/issues.md` must either be
-  referenced from an OpenSpec change under `openspec/changes/` or be marked done
-  (strikethrough title in the issue list).
+**Routes.** It compares the routes the router actually serves with the routes
+`docs/api-surface.md` documents. The registered side is modelled from source:
 
-The checker reports what it could **not** parse (currently: nested shorthand
-groups) instead of silently skipping it, and CI runs it **warn-only**
-(`.github/workflows/ci.yml`, job `docs-drift`, `continue-on-error: true`). Run it
-with `--strict` to make it fail, and `--root DIR` to run it against a fixture
-tree (that is what `tests/check-docs.sh` does).
+- literal `.route("/path", …)`;
+- dynamic `for v in ["2.0","2.1"] { … .route(&format!("/api/{v}/…"), …) }` loops
+  (jobs, mlflow, scim) — the loop variable is expanded over its value list;
+- `.nest("/prefix", …)` mounts — the bare subroutes of that module are expanded
+  under each prefix (Unity Catalog under `/api/2.{0,1}/unity-catalog`).
+
+The documented side expands backticked path tokens: `{a,b}` alternation, `[x]`
+optionals (recursively, so adjacent optionals such as `[a][b]` produce every
+variant), `{2.0,2.1}` version alternation, and `{*path}` wildcards. Bare
+continuation tokens (e.g. `/catalogs` under a declared mount) are matched to
+their registered prefixes, and the SCIM `also under /api/2.0/account/scim/v2`
+mirror is applied.
+
+**What it will NOT guess at.** The checker never claims coverage it does not
+have and never hides drift behind a guess. Everything it cannot model is
+reported in an explicit **NOT COMPARED** section (with counts and examples),
+never silently dropped and never mislabelled as drift:
+
+- documented `…` (ellipsis) notation, e.g. `/api/2.0/sql/endpoints…`;
+- `format!` route templates it cannot expand;
+- malformed or unbalanced shorthand.
+
+Namespace/mount prefixes (`/api/2.0/lakeforge`, `/api/2.0/unity-catalog`,
+`/api/2.1/unity-catalog`, the mlflow mounts, the account-SCIM mount) are
+**explicitly declared** in the doc (a trailing-slash `under …/`, a `mounted
+under/at`, or an `also under` note) and reported separately as family notation,
+not drift. The checker does **not** infer "family" from prefix membership — a
+removed parent that still has a live child (e.g. deleting `/api/items` while
+keeping `/api/items/{id}`) is reported as stale, exactly as it should be.
+
+**Issue references.** Every `LF-###` defined in `docs/issues.md` must be
+referenced from an OpenSpec change under `openspec/changes/` or be marked done.
+Only the two supported full-title strikethrough forms count as done —
+`### ~~LF-042 Title~~` and `### LF-042 ~~Title~~` — or an explicit `(done)` /
+`[done]` marker. A live title with a partial strike (e.g. `Replace ~~old~~
+wording`) is **not** treated as done.
+
+**Modes and integrity.** The report is **warn-only** by default (findings
+printed, exit 0); `--strict` exits 1 on findings. "Warn-only" applies to
+*findings only*: integrity failures — a missing/undeclared `--root`, an
+unwritable temp directory (`mktemp`), or a broken extraction pipeline — exit
+nonzero in both modes, so the checker can never fail open and report a bogus
+"OK". CI runs it in `.github/workflows/ci.yml` (job `docs-drift`): syntax and
+the fixture self-test (`tests/check-docs.sh`) gate the job, while the report
+step stays warn-only — there is deliberately no job-level `continue-on-error`.
 
 Adding a route without documenting it, or deleting a documented one, is drift the
 checker will report — update `docs/api-surface.md` in the same PR rather than
