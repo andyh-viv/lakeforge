@@ -108,13 +108,12 @@ jobs:
         run: bash -n deploy/deploy.sh
 
   docs-drift:
-    name: Docs drift (warn-only)
+    name: Docs drift (warn-only findings, gated checker)
     runs-on: ubuntu-latest
-    # Warn-only while the repo still carries drift (LF-026). The checker itself
-    # exits 0 in warn-only mode; `continue-on-error` keeps a new finding from
-    # blocking a merge until the backlog is cleared, at which point both this flag
-    # and the checker can be switched to --strict.
-    continue-on-error: true
+    # The checker's report is warn-only: it exits 0 when it finds drift, so drift
+    # findings stay advisory. "Warn-only" applies to FINDINGS only, not to the
+    # checker's own integrity. Syntax errors and a failing self-test MUST fail the
+    # job, so there is no `continue-on-error` here.
     steps:
       - uses: actions/checkout@v4
       - name: Checker syntax
@@ -123,5 +122,5 @@ jobs:
           bash -n tests/check-docs.sh
       - name: Checker self-test (fixtures)
         run: bash tests/check-docs.sh
-      - name: Docs drift report
+      - name: Docs drift report (warn-only)
         run: bash scripts/check-docs.sh
