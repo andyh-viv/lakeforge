@@ -192,12 +192,31 @@ fn free_port() -> Result<u16> {
     Ok(l.local_addr()?.port())
 }
 
-#[cfg(unix)]
+/// Whether `pid` refers to a live process.
+///
+/// Linux uses `/proc` (which correctly treats a zombie, `State:\tZ`, as dead).
+/// Every other Unix (macOS, *BSD) has no `/proc`, so it falls back to the
+/// portable `kill -0` probe: exit status 0 means the process exists. A pid of
+/// `0` is never a live process.
+#[cfg(target_os = "linux")]
 fn pid_alive(pid: u32) -> bool {
     pid != 0 && std::path::Path::new(&format!("/proc/{pid}")).exists()
         && !std::fs::read_to_string(format!("/proc/{pid}/status"))
             .map(|s| s.contains("State:\tZ"))
             .unwrap_or(true)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[cfg(not(unix))]
@@ -215,3 +234,47 @@ fn kill(pid: u32) {
 
 #[cfg(not(unix))]
 fn kill(_pid: u32) {}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::pid_alive;
+    use std::process::{Command, Stdio};
+
+    // Regression test for LF-029: on macOS the old `/proc`-only `pid_alive`
+    // always returned `false`, so a live `forge driver` was reported as
+    // TERMINATED. This test does not touch `/proc`, so it fails on the old
+    // implementation for every Unix target, including macOS.
+    #[test]
+    fn pid_alive_tracks_liveness_portably() {
+        // (a) a live child process is alive.
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert!(pid != 0, "spawned child should have a pid");
+        assert!(pid_alive(pid), "a live child process must report alive");
+
+        // (b) once killed and reaped, the pid is dead.
+        child.kill().expect("kill sleep");
+        child.wait().expect("reap sleep");
+
+        // `kill -0` can transiently succeed until the pid is fully reaped, so
+        // poll with a bounded budget rather than assuming instant death.
+        let mut dead = false;
+        for _ in 0..50 {
+            if !pid_alive(pid) {
+                dead = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(dead, "a reaped child process must report dead");
+
+        // (c) pid 0 is never alive.
+        assert!(!pid_alive(0), "pid 0 must never report alive");
+    }
+}
