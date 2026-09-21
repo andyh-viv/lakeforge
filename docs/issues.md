@@ -765,7 +765,7 @@ Conventions for every issue:
 - **Docs/parity**: `docs/development.md` test table; `tests/smoke/README.md`.
 - **OpenSpec**: `integrate-uc-sql-enforcement/tasks.md` (Testing section).
 
-### LF-026 Documentation and parity maintenance
+### ~~LF-026 Documentation and parity maintenance~~ (done — PR #4)
 
 - **Problem**: parity/status docs drift as features land; several docs
   (`architecture.md`, `api-surface.md`, `uc-lakebase-status.md`, `parity.md`,
