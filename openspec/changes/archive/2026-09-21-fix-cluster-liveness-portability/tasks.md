@@ -74,7 +74,8 @@ Tick items as they land. `[x]` = on branch
       polite signal and returns an error rather than reporting a false success, so
       a cluster handle is not cleared while a live process remains
 - [x] 2c.5 Regression test `status_reports_terminated_for_a_driver_reaped_by_another_sweep`
-      (the `status()` wiring, not just the sweep mechanism)
+      (the `status()` wiring, not just the sweep mechanism) — replaced in round 5
+      (2e.2) because it asserted the defective caller-pids-only sweep
 - [x] 2c.6 Regression test `recorded_exit_takes_precedence_over_the_probe` —
       verified to FAIL when the precedence is removed
 - [x] 2c.7 Regression test `reap_pids_force_kills_a_child_that_ignores_the_polite_signal`,
@@ -91,9 +92,9 @@ Tick items as they land. `[x]` = on branch
 ## 2d. Review remediation, round 4 (gpt-5.6-sol, same reviewer after round-3 fixes)
 
 - [x] 2d.1 Replace the bounded recently-exited retention ring with an
-      ownership-aware sweep: `sweep_exited(referenced)` skips any pid a cluster's
-      state still references, so the owner consumes the authoritative exit itself
-      and the guarantee no longer depends on ring capacity (the ring's
+      ownership-aware sweep: `sweep_exited(referenced)` skips any pid in the
+      reference set so the owner consumes the authoritative exit itself and the
+      guarantee no longer depends on ring capacity (the ring's
       capacity-dependence is removed)
 - [x] 2d.2 Two new regression tests replace the white-box ring test:
       `sweep_exited_retains_pids_its_cluster_still_references` (a referenced pid is
@@ -110,6 +111,29 @@ Tick items as they land. `[x]` = on branch
 - [x] 2d.4 Residual: the API-layer injected-failure path is not unit-tested — it
       needs the LF-025 integration harness — and is recorded rather than implied
       as covered
+
+## 2e. Review remediation, round 5 (gpt-5.6-sol, same reviewer after round-4 fixes)
+
+- [x] 2e.1 The sweep protects the COMPLETE set of state-referenced pids supplied
+      by the control plane, not the calling cluster's own pids: `status()` no
+      longer sweeps, `terminate()` no longer sweeps with an empty set, and
+      `monitor_clusters` collects every cluster's pids (via `referenced_pids`) and
+      calls `reap_orphans` once per tick
+- [x] 2e.2 Replaced `status_reports_terminated_for_a_driver_reaped_by_another_sweep`
+      (which asserted the defective behaviour) with the two-cluster regression
+      `reap_orphans_protects_another_clusters_referenced_exit`
+- [x] 2e.3 The startup-timeout path clears the handle only after successful
+      cleanup and persists a retryable `Terminating` state (with the handle and a
+      `cleanup incomplete` `state_message`) on failure; `start_cluster` refuses ANY
+      inactive cluster holding an unresolved handle via `ApiError::InvalidState`;
+      a post-launch persistence failure rolls the launch back
+- [x] 2e.4 Driver loss runs retryable cleanup before clearing the handle: on
+      success the cluster is `Terminated` and the handle cleared, on failure the
+      handle is retained and the cluster persisted `Terminating`
+- [x] 2e.5 API-layer regression tests with a scripted mock backend:
+      `settle_failed_launch_clears_handle_only_after_successful_cleanup`,
+      `start_cluster_refuses_any_inactive_cluster_holding_a_handle`, and
+      `monitor_driver_loss_cleans_up_before_clearing_the_handle`
 
 ## 3. Docs and spec
 
