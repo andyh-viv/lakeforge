@@ -46,19 +46,48 @@ assumes a non-zero pid is alive. (LF-029)
 The backend SHALL NOT retain the handle of a child process that has already
 exited: every sweep SHALL reap exited children and drop their handles, including
 children whose pids no longer appear in any cluster's state (executors removed by
-`resize`, and a dead driver's executors). Reaping SHALL be bounded so that an
-unresponsive process cannot block `resize`, `terminate` or `status`. A `try_wait`
-failure SHALL be reported, not silently treated as a liveness answer. (LF-029)
+`resize`, and a dead driver's executors). Reaping SHALL be bounded, and a process
+that survives the polite signal SHALL be force-killed, so an unresponsive process
+cannot block or silently outlive `resize`, `terminate` or `status`. (LF-029)
 
 #### Scenario: An exited child whose pid left cluster state is still collected
 - **GIVEN** a retained handle for a child that has exited and whose pid appears in
   no cluster state (e.g. an executor removed by `resize`)
 - **WHEN** the registry is swept
-- **THEN** the child is reaped and its handle removed, and the sweep reports how
-  many children it collected
+- **THEN** the child is reaped and its handle removed
 
-#### Scenario: A failed liveness query is reported rather than guessed
-- **GIVEN** a retained child whose `try_wait` call fails
-- **WHEN** the liveness check runs for that pid
-- **THEN** it reports an error instead of falling back to a probe, because a probe
-  cannot describe a child this process owns
+#### Scenario: A child that ignores the polite signal does not outlive its cluster
+- **GIVEN** a retained child that ignores the polite termination signal
+- **WHEN** its pids are reaped as the cluster is scaled down or terminated
+- **THEN** the reaper escalates to an uncatchable signal and reaps it, and if a
+  process still survives it reports an error rather than a false success, so the
+  cluster's handle is not cleared while that process is still running
+
+### Requirement: A cluster's own pids are never collected by another cluster's sweep
+
+A registry sweep SHALL NOT collect (reap and forget) a child whose pid a cluster's
+state still refers to. Such a pid SHALL be consumed by its owner through the
+owner's own liveness query, which reaps it and reports the authoritative exit. The
+guarantee SHALL NOT depend on a retention window or on how many children exited at
+once. A pid that no cluster's state refers to SHALL be collected by a sweep,
+however many such pids there are. The backend SHALL NOT hand a pid it spawned to
+the best-effort platform probe, which cannot distinguish a zombie from a live
+process and, on non-Unix targets, assumes a non-zero pid is alive. (LF-029)
+
+#### Scenario: A sweep does not collect a pid its cluster still references
+- **GIVEN** a retained, exited child whose pid appears in a cluster's state
+- **WHEN** a sweep runs for a different cluster
+- **THEN** the child is NOT collected, and the owning cluster's next liveness query
+  still reports the authoritative exit and reaps it
+
+#### Scenario: Every unreferenced exited child is collected, however many exited at once
+- **GIVEN** many exited children whose pids appear in no cluster state
+- **WHEN** a sweep runs
+- **THEN** all of them are collected in that pass, so the registry cannot grow
+  without bound and no exit is lost to a capacity limit
+
+#### Scenario: A failing sweep does not stop reconciliation for other clusters
+- **GIVEN** one registered child whose liveness query fails during a sweep
+- **WHEN** `status()` is called for a cluster that does not own that child
+- **THEN** the sweep logs the failure with its pid and continues, and the call
+  still succeeds; the error is surfaced only to the cluster that owns that child

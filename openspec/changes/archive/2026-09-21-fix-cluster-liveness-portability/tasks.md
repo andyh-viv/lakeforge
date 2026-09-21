@@ -25,8 +25,9 @@ Tick items as they land. `[x]` = on branch
 - [x] 2.2 Regression test `exited_but_unreaped_tracked_child_reports_dead`;
       verified to FAIL against the `kill -0`-only implementation
 - [x] 2.3 Non-Unix `pid_alive` honours the pid-0 invariant (`pid != 0`)
-- [x] 2.4 `terminate` reaps the handles it holds, bounded (≤1s), so a torn-down
-      cluster leaves no zombies
+- [x] 2.4 `terminate` reaps the handles it holds, bounded (a 20×50 ms polite
+      grace, then SIGKILL, then a 20×50 ms wait), so a torn-down cluster leaves
+      no zombies
 - [x] 2.5 Regression test `pid_zero_is_never_live` (both paths) and a RAII
       cleanup guard so a failing assertion cannot leak a child
 - [x] 2.6 Correct `proposal.md` to match the implementation (TERMINATED once the
@@ -42,16 +43,17 @@ Tick items as they land. `[x]` = on branch
 
 - [x] 2b.1 Stop falling back to a probe when `try_wait` errors: `pid_live` now
       returns `Result<bool>` and reports the failure instead of guessing
-- [x] 2b.2 Add `reap_exited()`, a registry-wide sweep called from `status()` and
+- [x] 2b.2 Add `sweep_exited()`, a registry-wide sweep called from `status()` and
       `terminate()`, so handles whose pids left cluster state are collected
 - [x] 2b.3 `resize()` reaps the executors it removes instead of leaking a handle
       (and a zombie) per scale-down
 - [x] 2b.4 `terminate()` reaps its own pids (bounded) then sweeps the registry, so
-      a process that exits after the cluster handle is cleared is still collected
+      orphaned executors from earlier scale-downs and children whose state was
+      already dropped are still collected
 - [x] 2b.5 Tolerate a poisoned registry mutex instead of panicking the monitor loop
 - [x] 2b.6 `spawn()` returns a launch error if the child has no pid, instead of
       storing pid `0`
-- [x] 2b.7 Regression test `reap_exited_collects_handles_whose_pids_left_cluster_state`;
+- [x] 2b.7 Regression test `sweep_exited_collects_handles_whose_pids_left_cluster_state`;
       verified to FAIL when the sweep is removed
 - [x] 2b.8 Make `exited_but_unreaped_tracked_child_reports_dead` deterministic:
       the child is stopped through its retained handle instead of being raced with
@@ -86,6 +88,29 @@ Tick items as they land. `[x]` = on branch
 - [x] 2b.9 Qualify the "exited ⇒ dead" claim in `proposal.md` to retained handles,
       and add the sweep requirement/scenarios to the spec delta
 
+## 2d. Review remediation, round 4 (gpt-5.6-sol, same reviewer after round-3 fixes)
+
+- [x] 2d.1 Replace the bounded recently-exited retention ring with an
+      ownership-aware sweep: `sweep_exited(referenced)` skips any pid a cluster's
+      state still references, so the owner consumes the authoritative exit itself
+      and the guarantee no longer depends on ring capacity (the ring's
+      capacity-dependence is removed)
+- [x] 2d.2 Two new regression tests replace the white-box ring test:
+      `sweep_exited_retains_pids_its_cluster_still_references` (a referenced pid is
+      never collected) and
+      `sweep_exited_collects_many_unreferenced_handles_in_one_pass` (300 children
+      in one pass)
+- [x] 2d.3 Three API-layer fixes in `crates/lakeforge-api/src/api/clusters.rs`,
+      building on `terminate_cluster` keeping the handle and a
+      `cleanup incomplete` `state_message` on failure: `start_cluster` refuses a
+      `Terminating` cluster that still holds a handle, `permanent_delete`
+      propagates a cleanup failure instead of deleting the record (a missing
+      cluster stays an idempotent success), and `monitor_clusters` retries a
+      `Terminating` cluster
+- [x] 2d.4 Residual: the API-layer injected-failure path is not unit-tested — it
+      needs the LF-025 integration harness — and is recorded rather than implied
+      as covered
+
 ## 3. Docs and spec
 
 - [x] 3.1 Add LF-029 to `docs/issues.md` section F (after LF-028) with
@@ -98,7 +123,7 @@ Tick items as they land. `[x]` = on branch
 
 ## 4. Verification
 
-- [x] 4.1 `cargo test -p lakeforge-cluster-manager` passes (7 tests)
+- [x] 4.1 `cargo test -p lakeforge-cluster-manager` passes (8 tests)
 - [x] 4.2 `cargo clippy --workspace --all-targets -- -D warnings` is clean
 - [x] 4.3 `openspec validate --changes` passes for this change
 - [x] 4.4 `tests/smoke/platform-smoke.sh` reaches `passed=39 failed=0` on macOS

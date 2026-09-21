@@ -50,16 +50,31 @@ Consequences on macOS (`main` @ 993cbd7):
    state) and a dead driver's executors. A failing `try_wait` during a sweep is
    logged with its pid and isolated to that child — it is not returned as an
    error, because `status()` runs once per cluster and one unqueryable child must
-   not stop reconciliation for every other cluster. Pids observed exiting are kept
-   in a bounded ring so a cluster whose child another cluster's sweep collected is
-   still told "dead" instead of being handed to the probe.
+   not stop reconciliation for every other cluster. A sweep never collects a pid a
+   cluster's state still references: the owner consumes that exit through its own
+   liveness query, so the authoritative answer is never handed to the best-effort
+   probe, and the guarantee does not depend on any retention window or capacity.
    `resize()` reaps the executors it removes directly, and `terminate()` reaps its
    own pids before sweeping. `reap_pids()` escalates from the polite signal to an
    uncatchable one and returns an error if a process survives both, so a cluster
    handle is never cleared while a live process remains. Sweeps are bounded and
    never block on an unresponsive process. The registry lock tolerates poisoning (a
    panic while held would otherwise take down the API's cluster monitor loop).
-4. **Regression tests** in `local.rs`'s `#[cfg(test)] mod tests`:
+4. **Cleanup failure is retryable across the API layer** in
+   `crates/lakeforge-api/src/api/clusters.rs`. When `backend.terminate` cannot
+   reap every process, `terminate_cluster` keeps the handle and a
+   `cleanup incomplete: …` `state_message` and returns an error rather than
+   clearing the handle (which would strand a live process with nothing pointing
+   at it), and a cluster left in `Terminating` is retried instead of
+   early-returning. `start_cluster` refuses a `Terminating` cluster that still
+   holds a handle, so a launch cannot overwrite the only handle to a process that
+   survived cleanup. `permanent_delete` propagates a cleanup failure instead of
+   deleting the record (the last reference), while a cluster that is already gone
+   stays an idempotent success. `monitor_clusters` retries a `Terminating`
+   cluster, so the "a later reconcile retries" claim is true rather than
+   aspirational. The injected-failure path is not unit-tested (it needs the
+   LF-025 integration harness) and is recorded as a residual below.
+5. **Regression tests** in `local.rs`'s `#[cfg(test)] mod tests`:
    - `pid_alive_tracks_liveness_portably` — a live child reports alive, a killed
      *and reaped* child reports dead, pid `0` reports dead. Does not touch
      `/proc`, so it fails on the original implementation on macOS.
@@ -73,8 +88,12 @@ Consequences on macOS (`main` @ 993cbd7):
      `resize` leak); verified to fail when the sweep is removed.
    - `status_reports_terminated_for_a_driver_reaped_by_another_sweep` — the
      `status()` wiring around the sweep, not just the mechanism.
-   - `recorded_exit_takes_precedence_over_the_probe` — a recorded exit is not
-     downgraded to the platform probe; verified to fail without the precedence.
+   - `sweep_exited_retains_pids_its_cluster_still_references` — a sweep never
+     collects a pid its cluster's state still references; the owner consumes the
+     exit itself. Verified to fail when the ownership guard is removed.
+   - `sweep_exited_collects_many_unreferenced_handles_in_one_pass` — 300
+     unreferenced exited children are all collected in one pass, so no exit is
+     lost to a capacity limit.
    - `reap_pids_force_kills_a_child_that_ignores_the_polite_signal` — a child that
      ignores SIGTERM is force-killed rather than left running; the child signals
      readiness first so the test cannot pass for the wrong reason, and it is
@@ -87,8 +106,13 @@ dead.
 
 ## Scope
 
-- `pid_alive` in `crates/lakeforge-cluster-manager/src/local.rs` and its test
-  module.
+- `crates/lakeforge-cluster-manager/src/local.rs`: `pid_alive` (the portable
+  probe), the retained-handle registry and its ownership-aware sweep
+  (`sweep_exited`), `pid_live`, `reap_pids`, and `status`/`resize`/`terminate`,
+  plus the test module.
+- `crates/lakeforge-api/src/api/clusters.rs`: cleanup-failure handling in
+  `terminate_cluster`, `start_cluster`, `permanent_delete`, and
+  `monitor_clusters`.
 
 ## Non-scope
 
@@ -105,28 +129,45 @@ dead.
   while its driver is alive, and TERMINATED once the driver exits — reported and
   reaped on the same `status()` call that observes it, so an exited driver never
   reads as RUNNING. This holds for the driver and executors the backend spawned
-  and still holds a handle for. Exited children are collected by a registry sweep
-  whether or not their pids remain in cluster state, so no handle is leaked and no
-  zombie is stranded. Linux behaviour is unchanged for the `/proc` path; spawned
-  children are now handle-based there too.
-- **Code**: `crates/lakeforge-cluster-manager/src/local.rs` only.
+  and still holds a handle for. No exited child is leaked or stranded: a child
+  whose pid no cluster state references is collected by a registry sweep, and a
+  child whose pid is still referenced is consumed by its owner's own liveness
+  query (the sweep never collects a referenced pid). Linux behaviour is unchanged
+  for the `/proc` path; spawned children are now handle-based there too.
+- **API cleanup**: a failed `backend.terminate` no longer clears the handle or
+  claims `Terminated`. `terminate_cluster` keeps the handle and a
+  `cleanup incomplete: …` `state_message` and returns an error, `start_cluster`
+  refuses a `Terminating` cluster that still holds a handle, `permanent_delete`
+  propagates the failure instead of deleting the record (a missing cluster stays
+  an idempotent success), and `monitor_clusters` retries a `Terminating` cluster.
+- **Code**: `crates/lakeforge-cluster-manager/src/local.rs` and
+  `crates/lakeforge-api/src/api/clusters.rs`.
 - **Specs**: new `cluster-lifecycle` capability spec, delta in
   `specs/cluster-lifecycle/spec.md` here.
 - **Docs**: `docs/issues.md` (LF-029 entry, Wave 0 index row).
-- **Tests**: `cargo test -p lakeforge-cluster-manager` (4 tests:
+- **Tests**: `cargo test -p lakeforge-cluster-manager` (8 tests:
   `pid_alive_tracks_liveness_portably`,
   `exited_but_unreaped_tracked_child_reports_dead`,
-  `reap_exited_collects_handles_whose_pids_left_cluster_state`,
-  `pid_zero_is_never_live`).
+  `sweep_exited_collects_handles_whose_pids_left_cluster_state`,
+  `status_reports_terminated_for_a_driver_reaped_by_another_sweep`,
+  `sweep_exited_retains_pids_its_cluster_still_references`,
+  `sweep_exited_collects_many_unreferenced_handles_in_one_pass`,
+  `reap_pids_force_kills_a_child_that_ignores_the_polite_signal`,
+  `pid_zero_is_never_live`). The API-layer injected-failure path is not
+  unit-tested and is recorded as a residual depending on the LF-025 integration
+  harness.
 
 ## Traceability
 
 - Issue: `docs/issues.md` → **LF-029**.
 - Branch: `fix/lf-029-cluster-liveness`; commits prefixed `LF-029: …`.
-- Review: independent `gpt-5.6-luna` reviews on PR #3. Round 1 returned
-  REQUEST_CHANGES (zombie handling, pid-0 on non-Unix); round 2 returned
-  REQUEST_CHANGES again (swallowed `try_wait` error, `resize` handle leak,
-  unswept executor handles). Both rounds are addressed here.
+- Review: independent reviews on PR #3 — `gpt-5.6-luna` (rounds 1–2) and
+  `gpt-5.6-sol` (rounds 3–4). Round 1: zombie handling, pid-0 on non-Unix.
+  Round 2: swallowed `try_wait` error, `resize` handle leak, unswept executor
+  handles. Round 3: sweep-failure isolation, recorded-exit precedence, force-kill
+  escalation. Round 4: the recorded-exit guarantee was capacity-dependent, and
+  cleanup failure was not safely retryable across the API. All rounds are
+  addressed here.
 
 ## Risks
 
