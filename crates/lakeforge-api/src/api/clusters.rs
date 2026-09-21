@@ -276,15 +276,24 @@ impl AppState {
 
     pub async fn terminate_cluster(&self, id: &str, reason: &str) -> ApiResult<()> {
         let mut c = self.get_cluster(id).await?.data;
-        if matches!(c.state, ClusterState::Terminated | ClusterState::Terminating) {
+        if matches!(c.state, ClusterState::Terminated) {
             return Ok(());
         }
+        // A cluster left in `Terminating` by a previous attempt whose cleanup did
+        // not finish is retried here instead of being reported as done.
         c.state = ClusterState::Terminating;
         self.save_cluster(&c).await?;
         if let Some(h) = &c.handle {
             self.forge.forget(&h.driver_addr);
             if let Err(e) = self.backend.terminate(h).await {
-                tracing::warn!(cluster = %id, error = %e, "terminate failed");
+                // The backend could not reap every process. Keep the handle and the
+                // state so a later reconcile retries the cleanup, and surface the
+                // failure: clearing the handle here would strand a live process with
+                // nothing left pointing at it.
+                tracing::warn!(cluster = %id, error = %e, "terminate incomplete");
+                c.state_message = format!("cleanup incomplete: {e}");
+                self.save_cluster(&c).await?;
+                return Err(ApiError::internal(format!("cluster {id}: {e}")));
             }
         }
         c.state = ClusterState::Terminated;
