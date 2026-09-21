@@ -151,18 +151,30 @@ impl LocalProcessBackend {
 
     /// Poll `pids` once: reap the ones that have exited, return the ones still
     /// running or unqueryable.
+    ///
+    /// For a pid this backend does NOT hold a handle for (a cluster recorded
+    /// before a control-plane restart has state but no child), it is NOT assumed
+    /// gone: the pid is probed with [`pid_alive`], and a pid that still reads
+    /// alive is returned as still-running so the caller can escalate. A pid that
+    /// reads dead is silently dropped from the set — it is already gone.
     fn reap_round(&self, pids: &[u32]) -> Vec<u32> {
         let mut still: Vec<u32> = Vec::new();
         let mut done: Vec<u32> = Vec::new();
         {
             let mut children = self.children();
             for pid in pids {
-                if let Some(child) = children.get_mut(pid) {
-                    match child.try_wait() {
+                match children.get_mut(pid) {
+                    Some(child) => match child.try_wait() {
                         Ok(Some(_)) => done.push(*pid),
                         Ok(None) => still.push(*pid),
                         Err(e) => {
                             tracing::warn!(pid = *pid, error = %e, "liveness query failed while reaping");
+                            still.push(*pid);
+                        }
+                    },
+                    // No retained handle: probe it rather than assume it is gone.
+                    None => {
+                        if pid_alive(*pid) {
                             still.push(*pid);
                         }
                     }
@@ -175,16 +187,26 @@ impl LocalProcessBackend {
         still
     }
 
-    /// Send an uncatchable signal to retained children.
+    /// Send an uncatchable signal to retained children, and to pids this backend
+    /// does not hold a handle for.
     fn force_kill(&self, pids: &[u32]) {
         let mut children = self.children();
         for pid in pids {
-            if let Some(child) = children.get_mut(pid) {
-                // `start_kill` is SIGKILL on Unix: a child that ignores SIGTERM
-                // cannot survive it, so cleanup cannot silently leave a live
-                // process behind after the cluster handle is cleared.
-                if let Err(e) = child.start_kill() {
-                    tracing::warn!(pid = *pid, error = %e, "force-kill failed");
+            match children.get_mut(pid) {
+                Some(child) => {
+                    // `start_kill` is SIGKILL on Unix: a child that ignores SIGTERM
+                    // cannot survive it, so cleanup cannot silently leave a live
+                    // process behind after the cluster handle is cleared.
+                    if let Err(e) = child.start_kill() {
+                        tracing::warn!(pid = *pid, error = %e, "force-kill failed");
+                    }
+                }
+                None => {
+                    // No retained handle: escalate with a direct SIGKILL, the only
+                    // uncatchable signal we can send to a pid we do not own.
+                    if let Err(e) = force_kill_untracked(*pid) {
+                        tracing::warn!(pid = *pid, error = %e, "force-kill (untracked) failed");
+                    }
                 }
             }
         }
@@ -192,6 +214,12 @@ impl LocalProcessBackend {
 
     /// Give pids that are leaving cluster state a bounded chance to exit, escalate
     /// to an uncatchable signal, then reap and forget their handles.
+    ///
+    /// Covers both tracked children and untracked pids (a cluster recorded before
+    /// a control-plane restart has state but no handle): a tracked child is reaped
+    /// through its handle, an untracked pid is verified through the probe and
+    /// force-killed with a direct SIGKILL, and either way an unconfirmed survivor
+    /// is an error, never a success.
     ///
     /// Bounded on purpose: an unresponsive process must not block `resize` or
     /// `terminate`. If a child is still running after the polite grace period it
@@ -411,9 +439,12 @@ impl ClusterBackend for LocalProcessBackend {
             kill(*pid);
         }
         // Reap this cluster's processes (escalating to an uncatchable signal if they
-        // ignore the polite one). A child that refuses even the escalated kill
-        // surfaces as an error so the caller can keep the state and retry rather
-        // than believe cleanup succeeded and strand a live process.
+        // ignore the polite one). This covers untracked pids too: a cluster recorded
+        // before a control-plane restart has state but no child handle, and such a
+        // pid is verified through the probe, force-killed with a direct SIGKILL if
+        // still alive, and reported as an error if it still cannot be confirmed
+        // gone — never a false success that would clear the last handle to a live
+        // process.
         //
         // NOTE: `terminate()` reaps only this cluster's own pids. It deliberately
         // does NOT sweep the registry with an empty reference set — doing so would
@@ -507,10 +538,37 @@ fn kill(pid: u32) {
 #[cfg(not(unix))]
 fn kill(_pid: u32) {}
 
+/// Send an uncatchable SIGKILL to a pid this backend does NOT hold a handle for
+/// (a cluster recorded before a control-plane restart has state but no child).
+/// `Child::start_kill` is unavailable for such a pid, so this shells out to
+/// `kill -KILL`, exactly as the SIGTERM path shells out to `kill -TERM`.
+#[cfg(unix)]
+fn force_kill_untracked(pid: u32) -> std::io::Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+    let status = std::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("kill -KILL {pid} exited with {status}")))
+    }
+}
+
+#[cfg(not(unix))]
+fn force_kill_untracked(_pid: u32) -> std::io::Result<()> {
+    // No signal to send on this target: the pid stays unconfirmed, so the
+    // caller reports an error rather than a false success.
+    Ok(())
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::{pid_alive, LocalProcessBackend};
-    use crate::ClusterBackend;
+    use crate::{ClusterBackend, ClusterHandle};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::process::Stdio;
@@ -881,6 +939,85 @@ mod tests {
             "the straggler must be reaped, not retained"
         );
         assert!(!be.pid_live(pid).expect("pid_live"), "the straggler must be dead");
+        let _ = std::fs::remove_file(&ready);
+    }
+
+    // Final-round finding (blocking): after a control-plane restart the `children`
+    // registry is empty, so a cluster recorded before the restart has state but no
+    // handle. `terminate()` used to send one SIGTERM and then reap only the pids it
+    // held a handle for — an untracked pid was silently skipped, so a
+    // SIGTERM-ignoring process read as "gone" and cleanup reported success while the
+    // process was still alive, clearing the last persisted handle.
+    //
+    // This pins the fix: an untracked-but-alive pid is probed, escalated to SIGKILL,
+    // and — if it still cannot be confirmed gone — reported as an error, never as
+    // success. The child is spawned with plain `std::process::Command` so it is NOT
+    // in `children`, and it ignores SIGTERM so the polite signal alone must not
+    // count as cleanup. On Linux the SIGKILLed (dead) child reads dead and
+    // `terminate` succeeds; on non-Linux the best-effort probe cannot distinguish a
+    // zombie, so `terminate` must conservatively error. Either outcome is allowed —
+    // "Ok while still alive" is not.
+    #[tokio::test]
+    async fn terminate_never_reports_success_for_an_untracked_alive_pid() {
+        let be = backend();
+
+        // A SIGTERM-ignoring shell, spawned with std::process::Command (NOT tracked).
+        // The readiness stamp proves the ignore-trap is installed before we signal.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let ready = std::env::temp_dir().join(format!("lf-untracked-ready-{stamp}"));
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "trap '' TERM; : > {}; while true; do sleep 1; done",
+                ready.display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn untracked SIGTERM-ignoring shell");
+        let pid = child.id();
+        assert!(pid != 0, "the spawned shell must have a pid");
+        let mut guard = Guard(child);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "the shell must report that its trap is installed");
+
+        // A cluster record as it would look after a control-plane restart: state
+        // points at a pid the backend holds no handle for.
+        let handle = ClusterHandle {
+            backend: "local".into(),
+            driver_addr: "http://127.0.0.1:1".into(),
+            state: serde_json::json!({
+                "driver_pid": pid,
+                "driver_port": 1,
+                "executor_pids": [],
+                "executor_ports": [],
+                "work_dir": "/tmp"
+            }),
+        };
+
+        let result = be.terminate(&handle).await;
+        match result {
+            Ok(()) => {
+                let gone = guard.0.try_wait().expect("try_wait");
+                assert!(
+                    gone.is_some(),
+                    "terminate reported success while the untracked child is still alive"
+                );
+            }
+            Err(_) => {
+                // Conservative: the process could not be confirmed gone. Acceptable —
+                // the guard reaps it on drop.
+            }
+        }
+
         let _ = std::fs::remove_file(&ready);
     }
 
