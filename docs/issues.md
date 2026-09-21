@@ -830,13 +830,48 @@ Conventions for every issue:
 - **Docs/parity**: `tests/smoke/README.md`.
 - **OpenSpec**: n/a.
 
+### LF-029 Portable cluster liveness (local backend reports every cluster TERMINATED on macOS)
+
+- **Problem**: `crates/lakeforge-cluster-manager/src/local.rs::pid_alive` is
+  gated `#[cfg(unix)]` but reads `/proc/<pid>`, which exists only on Linux.
+  On macOS (Unix without `/proc`) `Path::new("/proc/<pid>").exists()` is always
+  false, so `pid_alive` always returns false, `LocalProcessBackend::status()`
+  returns `Terminated` ("driver process exited") immediately after launch, and
+  the API reports every cluster TERMINATED while the `forge driver`/`executor`
+  processes are alive. The API then respawns clusters, leaking orphaned
+  processes.
+- **Evidence**: `local.rs` ~195; macOS baseline `main` @ 993cbd7:
+  `tests/smoke/platform-smoke.sh` = `passed=36 failed=3` (cluster RUNNING
+  TERMINATED after 60s), `tests/smoke/uc-lakebase-smoke.sh` = `passed=49
+  failed=1`; Linux CI reports 39/39 and 50/50; CI control-plane smoke never
+  creates a cluster.
+- **Scope**: `pid_alive` only. Keep the `/proc` implementation for Linux
+  (zombie-aware), add a portable `kill -0` probe for other Unix targets, keep
+  the non-Unix fallback, treat pid 0 as never alive. Regression test in
+  `local.rs` `mod tests`.
+- **Proposed implementation**: `#[cfg(target_os = "linux")]` keeps the
+  `/proc` form; `#[cfg(all(unix, not(target_os = "linux")))]` runs
+  `std::process::Command::new("kill").arg("-0").arg(pid).status()` and treats
+  exit 0 as alive. No new crate dependency (`libc` is not added).
+- **Dependencies**: none.
+- **Acceptance criteria**: a live child reports alive, a reaped child reports
+  dead, pid 0 reports dead, on Linux and macOS; `cargo test -p
+  lakeforge-cluster-manager` passes; clippy clean.
+- **Focused tests**: `cargo test -p lakeforge-cluster-manager`
+  (`pid_alive_tracks_liveness_portably`); fails on the old `/proc`-only form
+  on macOS.
+- **Docs/parity**: this entry; OpenSpec change
+  `fix-cluster-liveness-portability`.
+- **OpenSpec**: `openspec/changes/fix-cluster-liveness-portability/
+  specs/cluster-lifecycle/spec.md`.
+
 ---
 
 ## Index by dependency order
 
 | Wave | Issues | Why |
 | --- | --- | --- |
-| 0 | LF-028, LF-025, LF-026 | make the safety net reliable before touching semantics |
+| 0 | LF-028, LF-029, LF-025, LF-026 | make the safety net reliable before touching semantics |
 | 1 | LF-001, LF-002, LF-006, LF-013 | close the authorization/audit/Lakebase-lifecycle gaps that everything else builds on |
 | 2 | LF-003, LF-004, LF-005, LF-007, LF-008, LF-014, LF-015, LF-016, LF-027 | policy semantics, attribution, Lakebase model, object ACLs |
 | 3 | LF-009, LF-010, LF-011, LF-012, LF-020, LF-021, LF-022 | depth: column lineage, system-table cost, models, clients, UI |
