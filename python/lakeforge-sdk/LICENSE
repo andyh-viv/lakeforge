@@ -1,0 +1,217 @@
+LAKEFORGE REVENUE-RESTRICTED LICENSE
+Version 1.0 — 21 September 2026
+
+Copyright (c) 2026 Andy Huang. All rights reserved.
+
+This is a source-available license, NOT an open source license. It grants rights
+only to Organizations below the Revenue Threshold defined in Section 1.6. Read
+LICENSING.md for a plain-language summary; the terms below govern.
+
+By using, copying, modifying, distributing or deploying the Software, You accept
+this license. If You do not accept it, do not use the Software.
+
+1. DEFINITIONS
+
+  1.1 "Software" means the Lakeforge software and all associated source code,
+      documentation, specifications, configuration, container images, manifests
+      and other materials made available by the Licensor under this license,
+      including any Modified Version.
+
+  1.2 "Licensor" means the copyright holder named above.
+
+  1.3 "You" and "Your" mean the individual or legal entity exercising rights
+      under this license, together with the Organization of which You are a part.
+
+  1.4 "Organization" means You and every other entity that controls, is
+      controlled by, or is under common control with You. "Control" means
+      direct or indirect ownership of more than fifty percent (50%) of the
+      voting interests, or the power to direct or cause the direction of the
+      management or policies of an entity, whether by ownership, contract or
+      otherwise. Revenue of an Organization is the aggregate revenue of all such
+      entities, taken together; You may not reduce measured revenue by dividing
+      a group of entities among separate deployments, sublicenses, affiliates or
+      contracting parties.
+
+  1.5 "Modified Version" means any work that is based on, incorporates or is
+      derived from the Software, in whole or in part.
+
+  1.6 "Revenue Threshold" means United States dollars 10,000,000
+      (USD $10,000,000).
+
+  1.7 "Annual Revenue" means the total gross revenue of the Organization, as
+      reported in its financial statements:
+
+      (a) for its most recently completed fiscal year; or
+
+      (b) if it has not completed a fiscal year, for the twelve (12) months
+          ending on the date of Your first use of the Software.
+
+      Amounts denominated in another currency are converted to United States
+      dollars at the prevailing rate on the last day of the relevant period.
+      Gross revenue means revenue before deductions for costs, expenses or
+      taxes, and is not reduced by losses, deferrals or intercompany
+      eliminations within the Organization.
+
+  1.8 "Commercial License" means a separate written license granted by the
+      Licensor (or an authorized representative) that expressly permits use of
+      the Software by an Organization whose Annual Revenue meets or exceeds the
+      Revenue Threshold, on the terms stated in that license.
+
+  1.9 "Use" means to reproduce, execute, deploy, host, modify, distribute,
+      publicly display or perform, sublicense, or otherwise exploit the
+      Software or a Modified Version.
+
+2. GRANT BELOW THE REVENUE THRESHOLD
+
+  2.1 Subject to Your compliance with this license, the Licensor grants You a
+      worldwide, non-exclusive, royalty-free, non-transferable license, for the
+      term of this license, to Use the Software for any purpose — including
+      internal, commercial and production purposes — provided that Your
+      Organization's Annual Revenue is less than the Revenue Threshold.
+
+  2.2 You may permit a contractor, service provider or customer to Use the
+      Software on Your behalf only if they are bound in writing to terms no less
+      protective of the Licensor than this license, and only while Your
+      Organization remains below the Revenue Threshold.
+
+3. NO GRANT AT OR ABOVE THE REVENUE THRESHOLD
+
+  3.1 If Your Organization's Annual Revenue is equal to or greater than the
+      Revenue Threshold, NO LICENSE OR RIGHT TO USE THE SOFTWARE IS GRANTED
+      UNDER THIS LICENSE. You must obtain a Commercial License from the Licensor
+      before any Use. Nothing in this license implies, grants or may be read as
+      granting any such right, and no permission arises from the availability of
+      the source code, from any distribution channel, or from any past use.
+
+  3.2 If Your Organization's Annual Revenue meets or exceeds the Revenue
+      Threshold during the term of this license, Your rights under Section 2
+      continue only until the end of the then-current fiscal year, and any
+      further Use requires a Commercial License. Use that began below the
+      threshold does not become retroactively unlicensed; Use from that point
+      onward does.
+
+  3.3 Commercial licensing enquiries: andy.huangyh@gmail.com. Please include the
+      Organization's legal name, its Annual Revenue and its intended use.
+
+4. CONDITIONS
+
+  4.1 You must retain, in all copies and Modified Versions, this license text,
+      the copyright notice at the top of this file, and any other notices
+      supplied with the Software.
+
+  4.2 A Modified Version that You distribute or deploy must carry a prominent
+      notice stating that You changed the Software and the date of the change,
+      and must be licensed under these terms.
+
+  4.3 You may not sublicense the Software except under these terms, and only to
+      a recipient who is contractually bound to them.
+
+  4.4 You may not remove, obscure or alter any attribution, license notice or
+      provenance information in the Software.
+
+  4.5 This license grants no rights to the Licensor's names, logos or
+      trademarks.
+
+5. CONTRIBUTIONS
+
+  5.1 Unless You and the Licensor agree otherwise in a separate written
+      agreement, any contribution You intentionally submit for inclusion in the
+      Software is provided under the terms of this license, and You grant the
+      Licensor a perpetual, worldwide, irrevocable, royalty-free license to use,
+      reproduce, modify, distribute, sublicense and relicense that contribution,
+      including under a Commercial License. You represent that You are entitled
+      to grant that license.
+
+6. THIRD-PARTY COMPONENTS
+
+  6.1 The Software depends on and incorporates third-party components that are
+      licensed by their own authors under their own terms (for example the Rust
+      crates and JavaScript packages listed in the lockfiles and manifests).
+
+  6.2 This license does not apply to those components and does not restrict any
+      right You have to them under their own terms. Your obligations to those
+      authors are separate from, and in addition to, this license.
+
+7. TERM AND TERMINATION
+
+  7.1 This license takes effect on Your first Use and continues until
+      terminated.
+
+  7.2 Your rights terminate automatically, without notice, if:
+
+      (a) You breach any term of this license and do not cure the breach within
+          thirty (30) days of becoming aware of it; or
+
+      (b) Your Organization's Annual Revenue meets or exceeds the Revenue
+          Threshold and You continue to Use the Software without a Commercial
+          License, in which case termination takes effect at the end of the
+          fiscal year referred to in Section 3.2.
+
+  7.3 On termination You must cease all Use and delete or destroy all copies of
+      the Software and Modified Versions in Your possession or control, except
+      that You may retain copies to the extent required by law or by a
+      third-party component's own license.
+
+  7.4 Termination of Your rights does not affect the Licensor's other rights or
+      remedies, and does not terminate this license as against other licensees.
+
+8. DISCLAIMER OF WARRANTY
+
+  8.1 THE SOFTWARE IS PROVIDED "AS IS" AND "AS AVAILABLE", WITHOUT WARRANTY OF
+      ANY KIND, EXPRESS OR IMPLIED, INCLUDING WITHOUT LIMITATION THE WARRANTIES
+      OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE,
+      NON-INFRINGEMENT, ACCURACY AND QUIET ENJOYMENT.
+
+  8.2 The Licensor does not warrant that the Software is error-free, secure, or
+      fit for any regulated, safety-critical, or production purpose, and does
+      not undertake to provide support, maintenance, updates or corrections.
+
+  8.3 The Software reproduces the shape of certain third-party platform APIs for
+      compatibility purposes; it is an independent implementation and is not
+      affiliated with, endorsed by, or supported by any such platform vendor.
+
+9. LIMITATION OF LIABILITY
+
+  9.1 TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSOR SHALL NOT
+      BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, PUNITIVE OR
+      CONSEQUENTIAL DAMAGES, OR FOR ANY LOSS OF PROFITS, REVENUE, DATA, DATA
+      INTEGRITY, GOODWILL OR BUSINESS INTERRUPTION, ARISING OUT OF OR RELATING
+      TO THE SOFTWARE OR THIS LICENSE, HOWEVER CAUSED AND UNDER ANY THEORY OF
+      LIABILITY, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+  9.2 THE LICENSOR'S TOTAL AGGREGATE LIABILITY ARISING OUT OF OR RELATING TO THE
+      SOFTWARE OR THIS LICENSE SHALL NOT EXCEED THE GREATER OF (a) THE AMOUNTS
+      YOU PAID THE LICENSOR FOR THE SOFTWARE IN THE TWELVE (12) MONTHS BEFORE
+      THE EVENT GIVING RISE TO THE CLAIM, OR (b) ONE HUNDRED UNITED STATES
+      DOLLARS (USD $100).
+
+  9.3 Nothing in this license excludes or limits liability that cannot lawfully
+      be excluded or limited.
+
+10. GENERAL
+
+  10.1 Governing law: this license is governed by, and construed in accordance
+       with, the laws of the Licensor's principal place of business, excluding
+       its conflict-of-laws rules. The courts located in that jurisdiction have
+       exclusive jurisdiction, except that the Licensor may seek injunctive
+       relief in any jurisdiction to protect its intellectual property.
+
+  10.2 Severability: if any provision is held unenforceable, it is modified to
+       the minimum extent necessary and the remaining provisions stay in force.
+
+  10.3 No waiver: a failure to enforce any provision is not a waiver of it.
+
+  10.4 Entire agreement: this license, together with any Commercial License You
+       hold, is the entire agreement between You and the Licensor about the
+       Software, and supersedes prior discussions on that subject.
+
+  10.5 Versions: the Licensor may publish updated versions of this license for
+       later releases of the Software. The version that accompanied the release
+       You received governs that release, and rights already granted for it are
+       not narrowed by a later version, subject to Section 3.
+
+  10.6 Assignment: You may not assign this license without the Licensor's prior
+       written consent. The Licensor may assign it in connection with a merger,
+       acquisition or sale of assets.
+
+END OF TERMS

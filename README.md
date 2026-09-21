@@ -137,4 +137,17 @@ and Lakebase. The plan to continue is in
 
 ## License
 
-Apache-2.0.
+**Source-available, not open source.** Lakeforge is licensed under the
+[Lakeforge Revenue-Restricted License v1.0](LICENSE).
+
+- **Organizations with annual revenue under USD $10,000,000** may use Lakeforge
+  freely, including commercially and in production.
+- **Organizations with annual revenue of USD $10,000,000 or more** need a
+  commercial license before using it — contact
+  **andy.huangyh@gmail.com**.
+
+"Annual revenue" means the gross revenue of your whole Organization, including
+entities under common control. See [LICENSING.md](LICENSING.md) for a
+plain-language summary and [LICENSE](LICENSE) for the terms that govern.
+Third-party dependencies keep their own licenses (mostly Apache-2.0 and MIT) and
+are not affected by this one.
