@@ -4,6 +4,7 @@
 | --- | --- | --- | --- |
 | [`integrate-uc-sql-enforcement`](integrate-uc-sql-enforcement/proposal.md) | partially implemented; tasks open | LF-001..LF-012, LF-020, LF-021, LF-025..LF-028 | unity-catalog-authorization, unity-catalog-policies, unity-catalog-audit-lineage, unity-catalog-system-tables, unity-catalog-models |
 | [`implement-lakebase-control-plane`](implement-lakebase-control-plane/proposal.md) | control plane done (emulated); data plane open | LF-013..LF-019, LF-022, LF-023 | lakebase-instances, lakebase-credentials, lakebase-catalogs, lakebase-synced-tables, lakebase-emulation |
+| [`fix-cluster-liveness-portability`](fix-cluster-liveness-portability/proposal.md) | implemented; in review (PR #3) | LF-029 | cluster-lifecycle |
 
 ## Starting a new change
 
