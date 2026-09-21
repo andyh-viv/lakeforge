@@ -40,3 +40,25 @@ assumes a non-zero pid is alive. (LF-029)
 - **WHEN** the liveness check is applied to pid `0` on any target
 - **THEN** it reports dead, so a cluster record with a `0` driver pid is
   `Terminated` and can still be terminated
+
+### Requirement: Retained child handles are never leaked or stranded
+
+The backend SHALL NOT retain the handle of a child process that has already
+exited: every sweep SHALL reap exited children and drop their handles, including
+children whose pids no longer appear in any cluster's state (executors removed by
+`resize`, and a dead driver's executors). Reaping SHALL be bounded so that an
+unresponsive process cannot block `resize`, `terminate` or `status`. A `try_wait`
+failure SHALL be reported, not silently treated as a liveness answer. (LF-029)
+
+#### Scenario: An exited child whose pid left cluster state is still collected
+- **GIVEN** a retained handle for a child that has exited and whose pid appears in
+  no cluster state (e.g. an executor removed by `resize`)
+- **WHEN** the registry is swept
+- **THEN** the child is reaped and its handle removed, and the sweep reports how
+  many children it collected
+
+#### Scenario: A failed liveness query is reported rather than guessed
+- **GIVEN** a retained child whose `try_wait` call fails
+- **WHEN** the liveness check runs for that pid
+- **THEN** it reports an error instead of falling back to a probe, because a probe
+  cannot describe a child this process owns

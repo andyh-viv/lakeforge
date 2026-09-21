@@ -38,6 +38,27 @@ Tick items as they land. `[x]` = on branch
 - [x] 2.9 Document the `kill -0` residual (zombie/EPERM) and `PATH`-resolved
       `kill` in the module docs rather than leaving them implied
 
+## 2b. Review remediation, round 2 (same reviewer, after round-1 fixes)
+
+- [x] 2b.1 Stop falling back to a probe when `try_wait` errors: `pid_live` now
+      returns `Result<bool>` and reports the failure instead of guessing
+- [x] 2b.2 Add `reap_exited()`, a registry-wide sweep called from `status()` and
+      `terminate()`, so handles whose pids left cluster state are collected
+- [x] 2b.3 `resize()` reaps the executors it removes instead of leaking a handle
+      (and a zombie) per scale-down
+- [x] 2b.4 `terminate()` reaps its own pids (bounded) then sweeps the registry, so
+      a process that exits after the cluster handle is cleared is still collected
+- [x] 2b.5 Tolerate a poisoned registry mutex instead of panicking the monitor loop
+- [x] 2b.6 `spawn()` returns a launch error if the child has no pid, instead of
+      storing pid `0`
+- [x] 2b.7 Regression test `reap_exited_collects_handles_whose_pids_left_cluster_state`;
+      verified to FAIL when the sweep is removed
+- [x] 2b.8 Make `exited_but_unreaped_tracked_child_reports_dead` robust (child
+      `sleep 1`, no immediate-assert race) and drop the stale-guard nit in favour
+      of a bounded child lifetime, documented in the test
+- [x] 2b.9 Qualify the "exited ⇒ dead" claim in `proposal.md` to retained handles,
+      and add the sweep requirement/scenarios to the spec delta
+
 ## 3. Docs and spec
 
 - [x] 3.1 Add LF-029 to `docs/issues.md` section F (after LF-028) with
