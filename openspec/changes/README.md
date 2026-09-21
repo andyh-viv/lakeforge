@@ -5,6 +5,12 @@
 | [`integrate-uc-sql-enforcement`](integrate-uc-sql-enforcement/proposal.md) | partially implemented; tasks open | LF-001..LF-012, LF-020, LF-021, LF-025..LF-028 | unity-catalog-authorization, unity-catalog-policies, unity-catalog-audit-lineage, unity-catalog-system-tables, unity-catalog-models |
 | [`implement-lakebase-control-plane`](implement-lakebase-control-plane/proposal.md) | control plane done (emulated); data plane open | LF-013..LF-019, LF-022, LF-023 | lakebase-instances, lakebase-credentials, lakebase-catalogs, lakebase-synced-tables, lakebase-emulation |
 
+## Archived changes
+
+| Change | Archived | Issue | Live spec |
+| --- | --- | --- | --- |
+| [`2026-09-21-fix-cluster-liveness-portability`](archive/2026-09-21-fix-cluster-liveness-portability/proposal.md) | 2026-09-21 | LF-029 | `openspec/specs/cluster-lifecycle/spec.md` |
+
 ## Starting a new change
 
 Copy this skeleton to `changes/<change-id>/` (kebab-case verb phrase, e.g.

@@ -149,6 +149,19 @@ function ClusterDetail({ id }: { id: string }) {
       toast(e instanceof Error ? e.message : String(e), 'err')
     }
   }
+  // Permanent delete navigates away ONLY on success: a failed delete leaves the
+  // record behind, so navigating away would misleadingly drop the user on the
+  // list while the cluster still exists.
+  const permDelete = async () => {
+    if (!window.confirm('Permanently delete this cluster?')) return
+    try {
+      await api.post('/api/2.0/clusters/permanent-delete', { cluster_id: id })
+      toast('permanent-delete requested')
+      nav('/compute')
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e), 'err')
+    }
+  }
   if (c.isLoading) return <Spinner />
   if (!c.data) return <ErrorBox error={c.error ?? 'Cluster not found'} />
   const cl = c.data
@@ -162,7 +175,7 @@ function ClusterDetail({ id }: { id: string }) {
           {cl.state === 'RUNNING' && <button onClick={() => act('restart')}>↻ Restart</button>}
           {(cl.state === 'RUNNING' || cl.state === 'PENDING' || cl.state === 'RESIZING') && <button onClick={() => act('delete')}>■ Terminate</button>}
           <button onClick={() => setEdit(true)}>Edit</button>
-          <button className="danger" onClick={async () => { if (window.confirm('Permanently delete this cluster?')) { await act('permanent-delete'); nav('/compute') } }}>Delete</button>
+          <button className="danger" onClick={permDelete}>Delete</button>
         </>
       }
     >

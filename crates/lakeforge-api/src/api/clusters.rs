@@ -224,6 +224,18 @@ impl AppState {
         if matches!(c.state, ClusterState::Running | ClusterState::Pending | ClusterState::Restarting) {
             return Ok(());
         }
+        // A cluster that is not Running/Pending/Restarting yet still holds a handle
+        // holds the only reference to a process that survived cleanup (or whose
+        // cleanup is still pending). Launching a replacement here would overwrite
+        // that handle and strand the process, so refuse — whatever the inactive
+        // state — until the cleanup is completed or retried. `InvalidState` is the
+        // right error code for this state conflict, not `InvalidParameterValue`.
+        if c.handle.is_some() {
+            return Err(ApiError::InvalidState(format!(
+                "cluster {id} is in state {:?} with an unresolved backend handle ({})",
+                c.state, c.state_message
+            )));
+        }
         c.state = ClusterState::Pending;
         c.state_message = "Launching Forge driver and executors".into();
         c.start_time = now_ms();
@@ -244,7 +256,14 @@ impl AppState {
             }
         };
         c.handle = Some(handle.clone());
-        self.save_cluster(&c).await?;
+        if let Err(e) = self.save_cluster(&c).await {
+            // The handle was launched but its state could not be persisted. Roll the
+            // launch back rather than orphan a running cluster with no record: the
+            // handle is the only thing pointing at these processes, and letting it
+            // drop without termination would strand them.
+            let _ = self.backend.terminate(&handle).await;
+            return Err(e);
+        }
 
         let st = Arc::clone(self);
         let id = id.to_string();
@@ -265,35 +284,85 @@ impl AppState {
                 }
                 st.refresh_all_system_tables().await;
             } else {
-                c.state = ClusterState::Error;
-                c.state_message = "Driver did not become reachable".into();
-                let _ = st.save_cluster(&c).await;
-                let _ = st.backend.terminate(&handle).await;
+                // The driver never became reachable. Clean up retryably and only
+                // clear the handle once cleanup succeeds: a launch that timed out
+                // may still have live executors, and dropping the handle on a
+                // failed cleanup would strand them.
+                st.settle_failed_launch(&mut c, &handle).await;
             }
         });
         Ok(())
     }
 
+    /// Persist the outcome of a failed driver startup. Cleanup is retryable and
+    /// the handle is cleared ONLY after it succeeds; on failure the cluster is
+    /// left `Terminating` with the handle retained so `monitor_clusters` retries
+    /// it, and the incomplete cleanup is recorded in `state_message`.
+    async fn settle_failed_launch(&self, c: &mut Cluster, handle: &ClusterHandle) {
+        match self.backend.terminate(handle).await {
+            Ok(()) => {
+                c.state = ClusterState::Error;
+                c.state_message = "Driver did not become reachable".into();
+                c.handle = None;
+            }
+            Err(e) => {
+                c.state = ClusterState::Terminating;
+                c.state_message = format!("startup cleanup incomplete: {e}");
+                // handle retained for a later retry
+            }
+        }
+        let _ = self.save_cluster(c).await;
+    }
+
     pub async fn terminate_cluster(&self, id: &str, reason: &str) -> ApiResult<()> {
         let mut c = self.get_cluster(id).await?.data;
-        if matches!(c.state, ClusterState::Terminated | ClusterState::Terminating) {
+        if matches!(c.state, ClusterState::Terminated) {
             return Ok(());
         }
+        // A cluster left in `Terminating` by a previous attempt whose cleanup did
+        // not finish is retried here instead of being reported as done. A retry
+        // must preserve the reason that initiated the termination (persisted in
+        // `termination_reason`, e.g. DRIVER_UNREACHABLE from the monitor's
+        // driver-loss path) rather than the generic caller-supplied default, so
+        // the failure classification survives across reconcile ticks.
+        let retrying = c.state == ClusterState::Terminating;
+        let reason_code: String = if retrying {
+            c.termination_reason
+                .as_ref()
+                .and_then(|v| v.get("code"))
+                .and_then(|code| code.as_str())
+                .unwrap_or(reason)
+                .to_string()
+        } else {
+            reason.to_string()
+        };
         c.state = ClusterState::Terminating;
         self.save_cluster(&c).await?;
         if let Some(h) = &c.handle {
             self.forge.forget(&h.driver_addr);
             if let Err(e) = self.backend.terminate(h).await {
-                tracing::warn!(cluster = %id, error = %e, "terminate failed");
+                // The backend could not reap every process. Keep the handle and the
+                // state so a later reconcile retries the cleanup, and surface the
+                // failure: clearing the handle here would strand a live process with
+                // nothing left pointing at it.
+                tracing::warn!(cluster = %id, error = %e, "terminate incomplete");
+                c.state_message = format!("cleanup incomplete: {e}");
+                self.save_cluster(&c).await?;
+                return Err(ApiError::internal(format!("cluster {id}: {e}")));
             }
         }
         c.state = ClusterState::Terminated;
         c.terminated_time = now_ms();
         c.state_message = String::new();
-        c.termination_reason = Some(json!({ "code": reason, "type": if reason == "USER_REQUEST" { "SUCCESS" } else { "CLIENT_ERROR" } }));
+        // On a retry, keep the persisted reason (including its `type`) rather than
+        // overwriting it with the caller's default; on a fresh termination, record
+        // the caller's reason.
+        if !(retrying && c.termination_reason.is_some()) {
+            c.termination_reason = Some(json!({ "code": reason_code, "type": if reason_code == "USER_REQUEST" { "SUCCESS" } else { "CLIENT_ERROR" } }));
+        }
         c.handle = None;
         self.save_cluster(&c).await?;
-        self.cluster_event(id, "TERMINATING", json!({ "reason": { "code": reason } })).await?;
+        self.cluster_event(id, "TERMINATING", json!({ "reason": { "code": reason_code } })).await?;
         Ok(())
     }
 
@@ -336,23 +405,62 @@ impl AppState {
     /// Periodic health check: reconcile state with the backend, autoterminate idle clusters.
     pub async fn monitor_clusters(&self) -> ApiResult<()> {
         let clusters: Vec<Doc<Cluster>> = self.store.list(KIND, self.ws(), Filter::default()).await?;
+        // Collect the COMPLETE set of state-referenced pids up front, before the
+        // per-cluster pass, so the orphan sweep at the end protects every cluster's
+        // authoritative exit from being consumed by another cluster's sweep.
+        let mut all_pids: Vec<u32> = Vec::new();
+        for doc in &clusters {
+            if let Some(h) = &doc.data.handle {
+                all_pids.extend(self.backend.referenced_pids(h));
+            }
+        }
         for doc in clusters {
             let mut c = doc.data;
             let Some(h) = c.handle.clone() else { continue };
+            if matches!(c.state, ClusterState::Terminating) {
+                // A previous termination could not reap every process. Retry it here
+                // rather than leaving the handle — and the process it points at —
+                // unattended; `terminate_cluster` keeps the handle on failure.
+                let cid = c.cluster_id.clone();
+                if let Err(e) = self.terminate_cluster(&cid, "USER_REQUEST").await {
+                    tracing::warn!(cluster = %cid, error = %e, "retrying incomplete termination failed");
+                }
+                continue;
+            }
             if !matches!(c.state, ClusterState::Running | ClusterState::Pending) {
                 continue;
             }
             match self.backend.status(&h).await {
                 Ok(s) if s.state == BackendState::Terminated || s.state == BackendState::Error => {
-                    c.state = ClusterState::Terminated;
-                    c.terminated_time = now_ms();
-                    c.last_state_loss_time = now_ms();
-                    c.state_message = s.message.unwrap_or_else(|| "Backend reported cluster gone".into());
-                    c.termination_reason = Some(json!({ "code": "DRIVER_UNREACHABLE", "type": "SERVICE_FAULT" }));
-                    c.handle = None;
-                    self.forge.forget(&h.driver_addr);
-                    self.save_cluster(&c).await?;
-                    self.cluster_event(&c.cluster_id, "DRIVER_NOT_RESPONDING", json!({})).await?;
+                    // The driver is gone, but executors may still be alive. Run
+                    // retryable cleanup BEFORE clearing the handle: clearing it while
+                    // executors survive would strand live processes with nothing
+                    // pointing at them. Only clear the handle on success; on failure
+                    // retain it and mark the cluster `Terminating` for a later tick.
+                    match self.backend.terminate(&h).await {
+                        Ok(()) => {
+                            c.state = ClusterState::Terminated;
+                            c.terminated_time = now_ms();
+                            c.last_state_loss_time = now_ms();
+                            c.state_message = s.message.unwrap_or_else(|| "Backend reported cluster gone".into());
+                            c.termination_reason = Some(json!({ "code": "DRIVER_UNREACHABLE", "type": "SERVICE_FAULT" }));
+                            c.handle = None;
+                            self.forge.forget(&h.driver_addr);
+                            self.save_cluster(&c).await?;
+                            self.cluster_event(&c.cluster_id, "DRIVER_NOT_RESPONDING", json!({})).await?;
+                        }
+                        Err(e) => {
+                            tracing::warn!(cluster = %c.cluster_id, error = %e, "driver-loss cleanup incomplete");
+                            c.state = ClusterState::Terminating;
+                            c.state_message = format!("cleanup incomplete: {e}");
+                            c.last_state_loss_time = now_ms();
+                            // Persist the reason that initiated this cleanup, so a
+                            // later retry preserves DRIVER_UNREACHABLE rather than
+                            // falling back to the generic USER_REQUEST.
+                            c.termination_reason = Some(json!({ "code": "DRIVER_UNREACHABLE", "type": "SERVICE_FAULT" }));
+                            self.save_cluster(&c).await?;
+                        }
+                    }
                     continue;
                 }
                 Ok(_) => {}
@@ -365,6 +473,12 @@ impl AppState {
                     self.terminate_cluster(&c.cluster_id, "INACTIVITY").await?;
                 }
             }
+        }
+        // Reap orphaned children once per tick, protecting the complete reference
+        // set collected above so a sweep can never consume a cluster's still-
+        // referenced exit.
+        if let Err(e) = self.backend.reap_orphans(&all_pids).await {
+            tracing::warn!(error = %e, "orphan sweep failed");
         }
         Ok(())
     }
@@ -567,7 +681,13 @@ async fn delete(State(st): State<S>, Body(b): Body<IdBody>) -> ApiResult<Json<Va
 }
 
 async fn permanent_delete(State(st): State<S>, Body(b): Body<IdBody>) -> ApiResult<Json<Value>> {
-    let _ = st.terminate_cluster(&b.cluster_id, "USER_REQUEST").await;
+    // The record is the last reference to this cluster's processes. If cleanup
+    // fails, deleting anyway would strand them with nothing pointing at them, so
+    // surface the failure instead of ignoring it. A cluster that is already gone is
+    // still an idempotent success.
+    if st.get_cluster(&b.cluster_id).await.is_ok() {
+        st.terminate_cluster(&b.cluster_id, "USER_REQUEST").await?;
+    }
     st.store.delete(KIND, &b.cluster_id).await?;
     st.store.delete_children(KIND_EVENT, &b.cluster_id).await?;
     Ok(empty())
@@ -705,4 +825,234 @@ pub fn router() -> Router<S> {
         .route("/api/2.1/clusters/spark-versions", get(list_spark_versions))
         .route("/api/2.0/clusters/list-zones", get(list_zones))
         .route("/api/2.0/lakeforge/clusters/forge-status", get(forge_status))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Auth;
+    use crate::config::Config;
+    use crate::forge::ForgeRegistry;
+    use crate::kernel::KernelManager;
+    use crate::state::AppState;
+    use crate::storage::Storage;
+    use crate::store::Store;
+    use async_trait::async_trait;
+    use clap::Parser;
+    use lakeforge_cluster_manager::{BackendStatus, ClusterBackend, ClusterError, ClusterHandle, LaunchSpec};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A backend whose `status`/`terminate`/`launch` behaviour is scripted, so the
+    /// API-layer lifecycle paths can be exercised without a real `forge` binary.
+    struct MockBackend {
+        status: BackendState,
+        terminate_err: Option<String>,
+        launch_err: Option<String>,
+        /// Fail the first `fail_first_terminate` `terminate` calls, then succeed
+        /// (or honour `terminate_err`). Used to exercise a cleanup that fails
+        /// once and succeeds on a later retry.
+        fail_first_terminate: usize,
+        terminate_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ClusterBackend for MockBackend {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        async fn launch(&self, _spec: &LaunchSpec) -> lakeforge_cluster_manager::Result<ClusterHandle> {
+            if let Some(e) = &self.launch_err {
+                return Err(ClusterError::Launch(e.clone()));
+            }
+            Ok(ClusterHandle { backend: "mock".into(), driver_addr: "http://127.0.0.1:1".into(), state: json!({}) })
+        }
+        async fn status(&self, _handle: &ClusterHandle) -> lakeforge_cluster_manager::Result<BackendStatus> {
+            Ok(BackendStatus { state: self.status, message: None, ready_workers: 0 })
+        }
+        async fn resize(&self, _spec: &LaunchSpec, handle: &ClusterHandle) -> lakeforge_cluster_manager::Result<ClusterHandle> {
+            Ok(handle.clone())
+        }
+        async fn terminate(&self, _handle: &ClusterHandle) -> lakeforge_cluster_manager::Result<()> {
+            let call = self.terminate_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call <= self.fail_first_terminate {
+                return Err(ClusterError::Backend("terminate failed (simulated)".into()));
+            }
+            match &self.terminate_err {
+                Some(e) => Err(ClusterError::Backend(e.clone())),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn mock(status: BackendState) -> Arc<dyn ClusterBackend> {
+        Arc::new(MockBackend { status, terminate_err: None, launch_err: None, fail_first_terminate: 0, terminate_calls: AtomicUsize::new(0) })
+    }
+
+    fn mock_failing_terminate(status: BackendState) -> Arc<dyn ClusterBackend> {
+        Arc::new(MockBackend { status, terminate_err: Some("terminate failed".into()), launch_err: None, fail_first_terminate: 0, terminate_calls: AtomicUsize::new(0) })
+    }
+
+    fn mock_fail_terminate_once(status: BackendState) -> Arc<dyn ClusterBackend> {
+        Arc::new(MockBackend { status, terminate_err: None, launch_err: None, fail_first_terminate: 1, terminate_calls: AtomicUsize::new(0) })
+    }
+
+    async fn test_state(backend: Arc<dyn ClusterBackend>) -> Arc<AppState> {
+        let config = Config::parse_from(["lakeforge-api", "--database-url", "sqlite::memory:"]);
+        let store = Store::connect("sqlite::memory:").await.expect("connect in-memory store");
+        let storage = Storage::open("/tmp/lakeforge-cluster-test-storage").expect("open storage");
+        Arc::new(AppState {
+            config,
+            store,
+            storage,
+            auth: Auth::new(b"test-secret"),
+            backend,
+            forge: ForgeRegistry::default(),
+            kernels: KernelManager::new("python3".into(), "http://localhost:8080".into()),
+            statements: Default::default(),
+            contexts: Default::default(),
+            jobs_task_context: Default::default(),
+            runs: Default::default(),
+            started_at: chrono::Utc::now(),
+        })
+    }
+
+    fn test_handle() -> ClusterHandle {
+        ClusterHandle { backend: "mock".into(), driver_addr: "http://127.0.0.1:1".into(), state: json!({}) }
+    }
+
+    fn test_cluster(state: ClusterState, handle: Option<ClusterHandle>) -> Cluster {
+        serde_json::from_value(json!({
+            "cluster_id": "c-1",
+            "cluster_name": "test",
+            "state": state,
+            "state_message": "",
+            "creator_user_name": "tester",
+            "start_time": 0,
+            "handle": handle,
+        }))
+        .expect("valid cluster")
+    }
+
+    async fn insert_cluster(st: &AppState, c: &Cluster) {
+        st.store.insert(KIND, st.ws(), &c.cluster_id, None, Some(&c.cluster_name), c).await.expect("insert cluster");
+    }
+
+    // Round-5 finding (blocking 2): the startup-timeout path must not clear or
+    // ignore cleanup failure. The handle is cleared ONLY after cleanup succeeds;
+    // on failure the cluster is left `Terminating` with the handle retained so a
+    // later tick retries. (Under the old code, the failure was persisted as
+    // `Error` with the handle still attached but ignored, and `start_cluster`
+    // would overwrite it.)
+    #[tokio::test]
+    async fn settle_failed_launch_clears_handle_only_after_successful_cleanup() {
+        // Cleanup succeeds: handle is cleared, state is Error.
+        let st = test_state(mock(BackendState::Running)).await;
+        let handle = test_handle();
+        let c = test_cluster(ClusterState::Pending, Some(handle.clone()));
+        insert_cluster(&st, &c).await;
+        let mut c = c;
+        st.settle_failed_launch(&mut c, &handle).await;
+        assert_eq!(c.state, ClusterState::Error, "a failed launch whose cleanup succeeded is Error");
+        assert!(c.handle.is_none(), "the handle must be cleared after successful cleanup");
+        let saved = st.get_cluster("c-1").await.expect("get").data;
+        assert_eq!(saved.state, ClusterState::Error);
+        assert!(saved.handle.is_none());
+
+        // Cleanup fails: handle is retained and the cluster is retryably Terminating.
+        let st = test_state(mock_failing_terminate(BackendState::Running)).await;
+        let handle = test_handle();
+        let c = test_cluster(ClusterState::Pending, Some(handle.clone()));
+        insert_cluster(&st, &c).await;
+        let mut c = c;
+        st.settle_failed_launch(&mut c, &handle).await;
+        assert_eq!(c.state, ClusterState::Terminating, "failed cleanup must persist a retryable Terminating state");
+        assert!(c.handle.is_some(), "the handle must be retained when cleanup fails");
+        assert!(c.state_message.contains("cleanup incomplete"), "the incomplete cleanup must be recorded");
+        let saved = st.get_cluster("c-1").await.expect("get").data;
+        assert_eq!(saved.state, ClusterState::Terminating);
+        assert!(saved.handle.is_some());
+    }
+
+    // Round-5 finding (blocking 2): `start_cluster` must refuse to start ANY
+    // inactive cluster that still holds an unresolved handle — not just a
+    // `Terminating` one — so a launch cannot overwrite the only handle to a
+    // surviving process.
+    #[tokio::test]
+    async fn start_cluster_refuses_any_inactive_cluster_holding_a_handle() {
+        let st = test_state(mock(BackendState::Running)).await;
+        let c = test_cluster(ClusterState::Error, Some(test_handle()));
+        insert_cluster(&st, &c).await;
+
+        let res = st.start_cluster("c-1").await;
+        assert!(matches!(res, Err(ApiError::InvalidState(_))), "expected InvalidState, got {res:?}");
+
+        // The unresolved handle must be preserved, not overwritten.
+        let after = st.get_cluster("c-1").await.expect("get").data;
+        assert!(after.handle.is_some(), "the unresolved handle must not be overwritten");
+        assert_eq!(after.state, ClusterState::Error);
+    }
+
+    // Round-5 finding (blocking 3): driver death must not clear the handle while
+    // executors are still alive. The monitor runs retryable cleanup before
+    // clearing, and only clears on success; on failure it retains the handle and
+    // persists a `Terminating` state that a later tick retries.
+    #[tokio::test]
+    async fn monitor_driver_loss_cleans_up_before_clearing_the_handle() {
+        // Cleanup succeeds: Terminated + handle cleared.
+        let st = test_state(mock(BackendState::Terminated)).await;
+        let c = test_cluster(ClusterState::Running, Some(test_handle()));
+        insert_cluster(&st, &c).await;
+        st.monitor_clusters().await.expect("monitor");
+        let after = st.get_cluster("c-1").await.expect("get").data;
+        assert_eq!(after.state, ClusterState::Terminated);
+        assert!(after.handle.is_none(), "handle cleared after successful cleanup");
+
+        // Cleanup fails: handle retained + retryable Terminating.
+        let st = test_state(mock_failing_terminate(BackendState::Terminated)).await;
+        let c = test_cluster(ClusterState::Running, Some(test_handle()));
+        insert_cluster(&st, &c).await;
+        st.monitor_clusters().await.expect("monitor");
+        let after = st.get_cluster("c-1").await.expect("get").data;
+        assert_eq!(after.state, ClusterState::Terminating, "failed driver-loss cleanup must persist a retryable state");
+        assert!(after.handle.is_some(), "the handle must be retained while executors may still be alive");
+        assert!(after.state_message.contains("cleanup incomplete"));
+    }
+
+    // Final-round finding (blocking): a driver-loss termination that fails once and
+    // succeeds on a later retry must still be recorded as DRIVER_UNREACHABLE, not
+    // USER_REQUEST. The monitor used to retry a `Terminating` cluster with a
+    // hardcoded USER_REQUEST, overwriting the failure classification. This pins the
+    // provenance fix: the monitor persists the initiating reason on failure and the
+    // retry reuses it.
+    #[tokio::test]
+    async fn retried_driver_loss_cleanup_preserves_the_reason() {
+        let st = test_state(mock_fail_terminate_once(BackendState::Terminated)).await;
+        let c = test_cluster(ClusterState::Running, Some(test_handle()));
+        insert_cluster(&st, &c).await;
+
+        // First tick: driver loss detected, cleanup fails -> Terminating + handle
+        // retained + DRIVER_UNREACHABLE persisted.
+        st.monitor_clusters().await.expect("monitor");
+        let after = st.get_cluster("c-1").await.expect("get").data;
+        assert_eq!(after.state, ClusterState::Terminating, "failed driver-loss cleanup must persist Terminating");
+        assert!(after.handle.is_some(), "the handle must be retained");
+        assert_eq!(
+            after.termination_reason.as_ref().and_then(|v| v.get("code")).and_then(|c| c.as_str()),
+            Some("DRIVER_UNREACHABLE"),
+            "the initiating reason must be persisted on the failed cleanup"
+        );
+
+        // Second tick: the Terminating cluster is retried; cleanup now succeeds and
+        // must still be recorded as DRIVER_UNREACHABLE, not USER_REQUEST.
+        st.monitor_clusters().await.expect("monitor");
+        let after = st.get_cluster("c-1").await.expect("get").data;
+        assert_eq!(after.state, ClusterState::Terminated, "the retried cleanup succeeds");
+        assert!(after.handle.is_none(), "the handle is cleared after successful cleanup");
+        assert_eq!(
+            after.termination_reason.as_ref().and_then(|v| v.get("code")).and_then(|c| c.as_str()),
+            Some("DRIVER_UNREACHABLE"),
+            "the retried cleanup must preserve DRIVER_UNREACHABLE, not USER_REQUEST"
+        );
+    }
 }

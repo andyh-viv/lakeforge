@@ -830,13 +830,126 @@ Conventions for every issue:
 - **Docs/parity**: `tests/smoke/README.md`.
 - **OpenSpec**: n/a.
 
+### LF-029 Portable cluster liveness (local backend reports every cluster TERMINATED on macOS)
+
+- **Problem**: `crates/lakeforge-cluster-manager/src/local.rs::pid_alive` is
+  gated `#[cfg(unix)]` but reads `/proc/<pid>`, which exists only on Linux.
+  On macOS (Unix without `/proc`) `Path::new("/proc/<pid>").exists()` is always
+  false, so `pid_alive` always returns false, `LocalProcessBackend::status()`
+  returns `Terminated` ("driver process exited") immediately after launch, and
+  the API reports every cluster TERMINATED while the `forge driver`/`executor`
+  processes are alive. The API then respawns clusters, leaking orphaned
+  processes.
+- **Evidence**: `local.rs` ~195; macOS baseline `main` @ 993cbd7:
+  `tests/smoke/platform-smoke.sh` = `passed=36 failed=3` (cluster RUNNING
+  TERMINATED after 60s), `tests/smoke/uc-lakebase-smoke.sh` = `passed=49
+  failed=1`; Linux CI reports 39/39 and 50/50; CI control-plane smoke never
+  creates a cluster.
+- **Scope**: cluster liveness in the local backend. Liveness for the driver and
+  executors the backend spawns is answered from the retained child handle
+  (`Child::try_wait`, which reports *and reaps*), so an exited — even
+  not-yet-reaped — process reads dead on every platform; the `/proc` form is kept
+  for Linux, a `kill -0` probe covers other Unix targets for pids we do not hold,
+  a sweep never collects a pid a cluster's state still references, and pid 0 is
+  never alive. Cleanup reaps the handles it holds and escalates to an uncatchable
+  signal; a pid the backend does not hold (state recorded before a control-plane
+  restart) is probed, force-killed with a direct SIGKILL, and reported as an error
+  if it cannot be confirmed gone. The API layer keeps the handle and returns an
+  error when cleanup fails (`start_cluster` refuses ANY inactive cluster holding a
+  handle, `permanent_delete` propagates the failure, `monitor_clusters` retries
+  `Terminating` and preserves the initiating termination reason). Regression tests
+  in `local.rs` `mod tests`.
+- **Proposed implementation**: as built — `LocalProcessBackend` retains
+  `tokio::process::Child` handles; `status()` queries only its own pids
+  (authoritative) and does NOT sweep; the control plane sweeps once per tick via
+  `reap_orphans` with the reference set collected from the clusters it fetched,
+  and the sweep is ownership-aware — it skips any pid a cluster's state still
+  references, so the owner consumes the authoritative exit itself and the
+  guarantee does not depend on a retention window; `reap_pids()` escalates from
+  the polite signal to SIGKILL and returns an error rather than reporting a false
+  success. No new crate dependency (`libc` is not added).
+- **Dependencies**: none.
+- **Acceptance criteria**: a live child reports alive, an exited (reaped or not)
+  child reports dead **for a pid the backend holds a handle for** (for an untracked
+  pid, best-effort only: a dead-but-unreaped pid can read alive — LF-030), pid 0
+  reports dead, on Linux and macOS; `cargo test -p
+  lakeforge-cluster-manager` passes; clippy clean; macOS `platform-smoke.sh`
+  reaches `passed=39 failed=0`.
+- **Focused tests**: `cargo test -p lakeforge-cluster-manager` — nine tests,
+  including `pid_alive_tracks_liveness_portably`,
+  `exited_but_unreaped_tracked_child_reports_dead`,
+  `sweep_exited_collects_handles_whose_pids_left_cluster_state`,
+  `reap_orphans_protects_another_clusters_referenced_exit`,
+  `sweep_exited_retains_pids_its_cluster_still_references`,
+  `sweep_exited_collects_many_unreferenced_handles_in_one_pass`,
+  `reap_pids_force_kills_a_child_that_ignores_the_polite_signal`,
+  `terminate_never_reports_success_for_an_untracked_alive_pid` and
+  `pid_zero_is_never_live`. The liveness test fails on the old `/proc`-only form
+  on macOS. Four API-layer tests in `clusters.rs` (scripted mock backend) cover
+  the cleanup paths, including the cleanup-failure-then-retry path.
+- **Docs/parity**: this entry; archived OpenSpec change
+  `2026-09-21-fix-cluster-liveness-portability`.
+- **OpenSpec**: archived — `openspec/changes/archive/2026-09-21-fix-cluster-liveness-portability/`;
+  live spec `openspec/specs/cluster-lifecycle/spec.md`.
+
+### LF-030 Restart-time termination limitation (untracked pids cannot always be confirmed dead)
+
+- **Problem**: after a control-plane restart the local backend's `children`
+  registry is empty, so a cluster recorded before the restart has state but no
+  child handle. `terminate()` now probes such a pid, escalates to a direct
+  `kill -KILL`, and errors if it still cannot be confirmed gone (LF-029 round 6)
+  — but the confirmation relies on the best-effort probe, which on macOS/BSD
+  (`kill -0`) cannot distinguish a zombie from a live process and on non-Unix
+  assumes a non-zero pid is alive. A SIGKILLed process its parent has not yet
+  reaped therefore reads "alive", and the cluster stays `Terminating` with the
+  handle retained even though the process is dead.
+- **Evidence**: `crates/lakeforge-cluster-manager/src/local.rs::pid_alive`
+  (`kill -0` fallback), `reap_round`, `force_kill_untracked`;
+  `terminate_never_reports_success_for_an_untracked_alive_pid`.
+- **Scope**: process supervision for the local backend — re-parent spawned Forge
+  processes to a supervisor (or re-adopt them after a restart) so the control
+  plane always holds a reapable handle and the fallback probe is never the only
+  answer for a pid the backend spawned.
+- **Proposed implementation**: a subreaper/supervisor that owns and reaps the
+  children, so `Child::try_wait` (authoritative) is available after a restart.
+- **Dependencies**: none.
+- **Acceptance criteria**: after a control-plane restart, terminating a cluster
+  whose driver/executor is dead-but-unreaped confirms the exit through the handle
+  and reaches `Terminated` rather than stalling in `Terminating`.
+- **Focused tests**: `terminate_never_reports_success_for_an_untracked_alive_pid`,
+  plus a restart-simulation test once supervision lands.
+- **Docs/parity**: this entry; LF-029 entry above.
+- **OpenSpec**: `cluster-lifecycle` (restart-time termination).
+
+### LF-031 `kill` / `kill -0` / `kill -KILL` resolved through PATH, not `/bin/kill`
+
+- **Problem**: the local backend shells out to `kill` for the polite signal
+  (`kill -TERM`), the non-Linux liveness probe (`kill -0`), and the untracked-pid
+  escalation (`kill -KILL`) via `Command::new("kill")`, which resolves through
+  `PATH` rather than pinning `/bin/kill`. A manipulated `PATH` (or a shim earlier
+  in `PATH`) could substitute a different binary, and signal delivery is not
+  guaranteed to target the system `kill`.
+- **Evidence**: `crates/lakeforge-cluster-manager/src/local.rs::kill`,
+  `pid_alive` (non-Linux), `force_kill_untracked`.
+- **Scope**: pin the signal/probe path — use `/bin/kill` (or a `libc::kill`
+  call) instead of `PATH` resolution, keeping the probe/signal semantics.
+- **Proposed implementation**: replace `Command::new("kill")` with `/bin/kill` or
+  `libc::kill`; keep the same semantics.
+- **Dependencies**: none.
+- **Acceptance criteria**: `kill` resolution no longer depends on `PATH`; the
+  cluster-manager tests still pass.
+- **Focused tests**: existing `pid_alive_tracks_liveness_portably` and the
+  untracked-pid regression.
+- **Docs/parity**: this entry.
+- **OpenSpec**: n/a (hardening).
+
 ---
 
 ## Index by dependency order
 
 | Wave | Issues | Why |
 | --- | --- | --- |
-| 0 | LF-028, LF-025, LF-026 | make the safety net reliable before touching semantics |
+| 0 | LF-028, LF-029, LF-030, LF-031, LF-025, LF-026 | make the safety net reliable before touching semantics |
 | 1 | LF-001, LF-002, LF-006, LF-013 | close the authorization/audit/Lakebase-lifecycle gaps that everything else builds on |
 | 2 | LF-003, LF-004, LF-005, LF-007, LF-008, LF-014, LF-015, LF-016, LF-027 | policy semantics, attribution, Lakebase model, object ACLs |
 | 3 | LF-009, LF-010, LF-011, LF-012, LF-020, LF-021, LF-022 | depth: column lineage, system-table cost, models, clients, UI |

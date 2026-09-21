@@ -81,6 +81,27 @@ pub trait ClusterBackend: Send + Sync {
     async fn status(&self, handle: &ClusterHandle) -> Result<BackendStatus>;
     async fn resize(&self, spec: &LaunchSpec, handle: &ClusterHandle) -> Result<ClusterHandle>;
     async fn terminate(&self, handle: &ClusterHandle) -> Result<()>;
+
+    /// Reap retained child processes that have exited and that no cluster's
+    /// state references any more, returning the number reaped.
+    ///
+    /// `referenced` is the COMPLETE set of pids referenced by every cluster's
+    /// state in the workspace, collected by the control plane once per
+    /// reconcile tick. A backend that does not retain child handles (the
+    /// Kubernetes backend) has nothing to reap and returns `Ok(0)`.
+    async fn reap_orphans(&self, referenced: &[u32]) -> Result<usize> {
+        let _ = referenced;
+        Ok(0)
+    }
+
+    /// The pids a cluster handle references (driver + executors), if the backend
+    /// tracks pids at all. The Kubernetes backend tracks object names rather than
+    /// pids and returns an empty vector. Used by the control plane to build the
+    /// complete reference set it passes to [`ClusterBackend::reap_orphans`].
+    fn referenced_pids(&self, handle: &ClusterHandle) -> Vec<u32> {
+        let _ = handle;
+        Vec::new()
+    }
 }
 
 /// Build the backend named by `LAKEFORGE_CLUSTER_BACKEND` (`local` | `kubernetes`).
