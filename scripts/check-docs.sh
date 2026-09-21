@@ -193,11 +193,15 @@ say "check-docs: issue references"
 if [ ! -f "$ISSUES" ]; then
   say "  (skipped: $ISSUES not found)"
 else
-  # Defined issues: "### LF-042 Title". Marked done = strikethrough title or an
-  # explicit "(done)" marker, which is what this repo's convention uses.
-  defined="$(sed -n 's/^### \(LF-[0-9][0-9]*\).*/\1/p' "$ISSUES" | sort -u)"
-  done_ids="$(grep -E '^### LF-[0-9]+' "$ISSUES" | grep -E '~~|\(done\)|\[done\]' \
-    | sed -n 's/^### \(LF-[0-9][0-9]*\).*/\1/p' | sort -u)"
+  # Defined issues: "### LF-042 Title", and also the done convention
+  # "### ~~LF-042 Title~~ (done — PR #n)" where the strikethrough wraps the id too.
+  # Two spellings of the same shape: sed is BRE, grep -E is ERE.
+  DEF_BRE='^### \(~~\)\{0,1\}\(LF-[0-9][0-9]*\)'
+  DEF_ERE='^### (~~)?(LF-[0-9][0-9]*)'
+  defined="$(sed -n "s/${DEF_BRE}.*/\2/p" "$ISSUES" | sort -u)"
+  # Marked done = strikethrough anywhere on the heading, or an explicit marker.
+  done_ids="$(grep -E "$DEF_ERE" "$ISSUES" | grep -E '~~|\(done\)|\[done\]' \
+    | sed -n "s/${DEF_BRE}.*/\2/p" | sort -u)"
   # Referenced from any OpenSpec change artifact.
   referenced="$(grep -rhoE 'LF-[0-9][0-9]*' "$CHANGES" 2>/dev/null | sort -u)"
 
@@ -210,7 +214,9 @@ else
     n_orphan=$((n_orphan + 1))
   done
 
-  say "  defined=$n_def referenced-by-openspec=$(printf '%s\n' "$referenced" | grep -c '^LF-' || true) done=$((n_def - n_orphan)) needed=$n_orphan"
+  n_ref="$(printf '%s\n' "$referenced" | grep -c '^LF-' || true)"
+  n_done="$(printf '%s\n' "$done_ids" | grep -c '^LF-' || true)"
+  say "  defined=$n_def referenced-by-openspec=$n_ref marked-done=$n_done uncovered=$n_orphan"
   if [ "$n_orphan" != "0" ]; then
     say "  issues neither referenced by an OpenSpec change nor marked done:"
     for id in $orphans; do say "    $id"; done

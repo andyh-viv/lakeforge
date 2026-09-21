@@ -54,6 +54,8 @@ MD
 
 ### LF-901 ~~An issue that is done~~
 
+### ~~LF-903 A done issue whose id is inside the strikethrough~~ (done — PR #4)
+
 ### LF-902 An issue referenced by a change
 MD
   cat > "$d/openspec/changes/demo/proposal.md" <<'MD'
@@ -81,6 +83,11 @@ case "$OUT1" in
   *LF-901*) bad "a done issue (~~strikethrough~~) must not be reported" ;;
   *) ok "treats a struck-through issue as done" ;;
 esac
+case "$OUT1" in
+  *LF-903*) bad "a done issue with the id inside the strikethrough (the repo's real convention) must not be reported" ;;
+  *) ok "treats the repo's real done convention (~~LF-nnn ...~~) as done" ;;
+esac
+check_contains "counts a struck-through issue as defined" "$OUT1" "defined=4"
 case "$OUT1" in
   *LF-902*) bad "an issue referenced by an OpenSpec change must not be reported" ;;
   *) ok "treats an OpenSpec-referenced issue as covered" ;;
